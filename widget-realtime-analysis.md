@@ -402,6 +402,183 @@ events: {
 
 ---
 
+### 3.5 跨域边界详解：宿主页、Iframe、后端三方交互
+
+为了清晰理解哪些请求真正跨域、哪些是同源调用、哪些依赖 CORS，我们需要分析整个三方架构的通信边界。
+
+#### 3.5.1 架构角色与域名
+
+| 角色 | 运行环境 | 域名示例 | 说明 |
+|-----|---------|---------|------|
+| **宿主页** | 客户网站前端 | `https://customer.com` | 嵌入 Widget 的第三方网站 |
+| **Iframe 内** | Chatwoot Widget 前端 | `https://chatwoot.com` | 实际运行 Widget Vue 应用的环境 |
+| **后端** | Chatwoot Rails 服务 | `https://chatwoot.com` | API 服务、WebSocket 服务 |
+
+#### 3.5.2 完整通信链路与跨域分析
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                           跨域边界与通信链路详细图                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                        │
+│  宿主页 (customer.com)                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  1️⃣ SDK 脚本加载 (跨域 GET，依赖 CORS)                                         │   │
+│  │     ┌─────────────┐                                                          │   │
+│  │     │ <script>    │  GET https://chatwoot.com/packs/js/sdk.js              │   │
+│  │     │ 动态创建    │  ─────────────────────────────────────►                  │   │
+│  │     └─────────────┘                                                          │   │
+│  │                                                                              │   │
+│  │  2️⃣ Iframe 创建 (导航，非 XHR，不依赖 CORS)                                   │   │
+│  │     ┌─────────────────┐                                                      │   │
+│  │     │ <iframe>        │  src = "https://chatwoot.com/widget?website_token=│   │
+│  │     │                 │        abc123&cw_conversation=eyJ..."              │   │
+│  │     └─────────────────┘                                                      │   │
+│  │                                                                              │   │
+│  │  3️⃣ PostMessage 通信 (浏览器原生，不依赖 CORS)                                 │   │
+│  │     window.postMessage() ◄───────────────────────────────────────────────► │   │
+│  │                                                                              │   │
+│  │  可通信的事件类型:                                                             │   │
+│  │  - 'config-set', 'toggle-open', 'set-user', 'set-custom-attributes'...    │   │
+│  │  - 'loaded', 'setAuthCookie', 'error', 'onEvent'...                        │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                                 │
+│                                      │ iframe 导航                                     │
+│                                      ▼                                                 │
+│  Iframe 内 (chatwoot.com)                                                            │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  4️⃣ Iframe 内资源加载 (同源，不跨域)                                           │   │
+│  │     - GET /packs/js/widget.js (Vite 入口)                                   │   │
+│  │     - GET /packs/css/widget.css                                              │   │
+│  │                                                                              │   │
+│  │  5️⃣ API 调用 (同源，不跨域，不依赖 CORS)                                       │   │
+│  │     ┌─────────────────────────────────────────────────────────────────┐   │   │
+│  │     │ axios 请求 (Base URL 为空或相对路径)                              │   │   │
+│  │     │                                                                   │   │   │
+│  │     │ GET    /api/v1/widget/messages          (获取历史消息)           │   │   │
+│  │     │ POST   /api/v1/widget/messages          (发送消息)               │   │   │
+│  │     │ PATCH  /api/v1/widget/contact/set_user  (设置用户身份)           │   │   │
+│  │     │ GET    /api/v1/widget/contact           (获取当前联系人)          │   │   │
+│  │     │ PATCH  /api/v1/widget/conversations     (切换对话状态)            │   │   │
+│  │     └─────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                              │   │
+│  │  6️⃣ WebSocket 连接 (同源，不跨域)                                             │   │
+│  │     ┌─────────────────────────────────────────────────────────────────┐   │   │
+│  │     │ Action Cable WebSocket                                             │   │   │
+│  │     │ wss://chatwoot.com/cable                                           │   │   │
+│  │     │                                                                   │   │   │
+│  │     │ 订阅参数:                                                          │   │   │
+│  │     │ - channel: 'RoomChannel'                                          │   │   │
+│  │     │ - pubsub_token: contact_inbox.pubsub_token                       │   │   │
+│  │     │ - account_id: 当前账户 ID                                          │   │   │
+│  │     └─────────────────────────────────────────────────────────────────┘   │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                      │                                                 │
+│                                      │ HTTP/WebSocket                                   │
+│                                      ▼                                                 │
+│  后端 (chatwoot.com)                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │                                                                              │   │
+│  │  7️⃣ 处理 Iframe 页面请求 (WidgetsController)                                  │   │
+│  │     GET /widget?website_token=xxx&cw_conversation=yyy                      │   │
+│  │                                                                              │   │
+│  │  8️⃣ 处理 API 请求 (Api::V1::Widget::BaseController)                          │   │
+│  │     - 认证: X-Auth-Token 请求头 + website_token 参数                        │   │
+│  │     - 路由: /api/v1/widget/*                                                 │   │
+│  │                                                                              │   │
+│  │  9️⃣ WebSocket 连接 (RoomChannel)                                             │   │
+│  │     - 通过 pubsub_token 识别订阅者 (Contact 或 User)                         │   │
+│  │     - 订阅: stream_from pubsub_token                                         │   │
+│  │                                                                              │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                        │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 3.5.3 请求分类与 CORS 依赖对照表
+
+| 请求编号 | 发起方 | 目标方 | 请求类型 | 是否跨域 | 是否依赖 CORS | 说明 |
+|---------|-------|-------|---------|---------|--------------|------|
+| 1️⃣ | 宿主页 `customer.com` | 后端 `chatwoot.com` | GET `/packs/js/sdk.js` | **是** | **是** | 静态资源，CORS 配置允许 `/packs/*` |
+| 2️⃣ | 宿主页 `customer.com` | 后端 `chatwoot.com` | iframe 导航 `/widget` | **是** | **否** | 浏览器导航行为，非 XHR，无需 CORS |
+| 3️⃣ | 宿主页 ↔ iframe | 宿主页 ↔ iframe | `postMessage` | - | **否** | 浏览器原生通信机制，不受 CORS 限制 |
+| 4️⃣ | iframe `chatwoot.com` | 后端 `chatwoot.com` | GET 静态资源 | **否** | **否** | 同源请求 |
+| 5️⃣ | iframe `chatwoot.com` | 后端 `chatwoot.com` | API 调用 (`/api/v1/widget/*`) | **否** | **否** | 同源请求，无需 CORS |
+| 6️⃣ | iframe `chatwoot.com` | 后端 `chatwoot.com` | WebSocket (`/cable`) | **否** | **否** | 同源 WebSocket，无需 CORS |
+
+#### 3.5.4 关键结论
+
+1. **真正跨域且依赖 CORS 的只有 SDK 脚本加载**
+   - 路径: `/packs/js/sdk.js`
+   - CORS 配置: `config/initializers/cors.rb` 中 `resource '/packs/*'` 允许所有来源
+
+2. **Iframe 内的所有 API 调用都是同源的**
+   - Iframe 的 `src` 指向 `chatwoot.com/widget`
+   - 因此 Iframe 内的 origin 是 `chatwoot.com`
+   - 所有 API 调用 (`/api/v1/widget/*`) 都是同源请求
+   - **不需要 `ENABLE_API_CORS` 环境变量**
+
+3. **PostMessage 是跨域 DOM 交互的核心桥梁**
+   - 宿主页 SDK 与 Iframe 内的 Vue 应用通过 `postMessage` 通信
+   - 这种方式完全绕过了 CORS 限制
+   - 但需要双方约定消息格式前缀 (`chatwoot-widget:`)
+
+4. **宿主页能否直接调用 API？**
+   - 技术上可以，但需要启用 `ENABLE_API_CORS=true`
+   - 但 Chatwoot 的设计是：所有 API 调用都从 Iframe 内发起
+   - 宿主页只通过 `postMessage` 间接触发操作
+
+#### 3.5.5 PostMessage 事件协议详解
+
+**文件**: `app/javascript/widget/helpers/utils.js:8-23`
+
+```javascript
+export const WOOT_PREFIX = 'chatwoot-widget:';
+
+export const IFrameHelper = {
+  isIFrame: () => window.self !== window.top,
+  sendMessage,
+  isAValidEvent: e => {
+    const isDataAString = typeof e.data === 'string';
+    return isDataAString && e.data.indexOf(WOOT_PREFIX) === 0;
+  },
+  getMessage: e => JSON.parse(e.data.replace(WOOT_PREFIX, '')),
+};
+```
+
+**宿主页 → Iframe 的事件** (SDK 发送)：
+
+| 事件名 | 触发时机 | 数据内容 |
+|-------|---------|---------|
+| `config-set` | Iframe 加载完成后 | locale, position, hideMessageBubble, widgetStyle, darkMode 等 |
+| `toggle-open` | 用户点击气泡开关 | `{ isOpen: true/false }` |
+| `set-user` | 调用 `window.$chatwoot.setUser()` | `{ identifier, user: { email, name, identifier_hash, ... } }` |
+| `set-custom-attributes` | 调用 `setCustomAttributes()` | `{ customAttributes: {...} }` |
+| `set-locale` | 调用 `setLocale()` | `{ locale: 'zh-CN' }` |
+| `set-color-scheme` | 调用 `setColorScheme()` | `{ darkMode: 'dark' }` |
+| `push-event` | 内部触发 | `{ eventName: 'webwidget.triggered' }` |
+| `set-label` | 调用 `setLabel()` | `{ label: 'vip' }` |
+| `change-url` | 页面 URL 变化时 | `{ referrerURL, referrerHost }` |
+
+**Iframe → 宿主页的事件** (Widget 发送)：
+
+| 事件名 | 触发时机 | 数据内容 |
+|-------|---------|---------|
+| `loaded` | Widget 初始化完成 | `{ config: { authToken, channelConfig: {...} } }` |
+| `setAuthCookie` | set_user 后令牌刷新 | `{ data: { widgetAuthToken: 'eyJ...' } }` |
+| `error` | 操作失败 | `{ errorType: 'SET_USER_ERROR', data: {...} }` |
+| `onEvent` | SDK 事件回调 | `{ eventIdentifier: 'onMessage', data: {...} }` |
+| `updateIframeHeight` | 内容高度变化 | `{ extraHeight, isFixedHeight }` |
+| `setBubbleLabel` | 设置气泡文案 | `{ label: '与我们聊天' }` |
+| `handleNotificationDot` | 未读消息变化 | `{ unreadMessageCount: 3 }` |
+| `setUnreadMode` / `resetUnreadMode` | 未读状态变化 | - |
+
+---
+
 ## 4. 实时推送机制（WebSocket / Action Cable）
 
 ### 4.1 技术栈
