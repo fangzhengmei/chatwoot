@@ -12,13 +12,13 @@ Chatwoot 实现了一个完整的实时消息广播系统，能够在服务端�
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                           数据变更层 (Models/Services)                        │
 │  Message / Conversation / Contact / Notification / Assignment 等模型变更      │
-│         ↓ 触发 after_create / after_update / after_destroy 回调               │
+│         ↓ 触发 after_create_commit / after_update_commit 回调                  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     ↓
 ┌─────────────────────────────────────────────────────────────────────────────┐
 │                              事件分发层 (Dispatcher)                          │
 │  Rails.configuration.dispatcher.dispatch(event_name, timestamp, data)        │
-│         ↓ Wisper::Publisher 发布事件                                          │
+│         ↓ SyncDispatcher / AsyncDispatcher 分别处理                            │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     ↓
          ┌──────────────────────────────────────────────────────┐
@@ -72,40 +72,70 @@ Chatwoot 实现了一个完整的实时消息广播系统，能够在服务端�
 
 服务端的数据变更通过 ActiveRecord 回调触发事件。主要在以下模型中实现：
 
-**Message 模型** (`app/models/message.rb:378-383`):
+**Message 模型回调定义** (`app/models/message.rb:137-140`):
 ```ruby
-after_create :dispatch_create_events
+after_create_commit :execute_after_create_commit_callbacks
+after_update_commit :dispatch_update_event
+after_commit :reindex_for_search, if: :should_index?, on: [:create, :update]
+```
 
+**关键点**：
+- 使用 `after_create_commit` 而非 `after_create`，确保**数据库事务提交后**再触发事件
+- 使用 `after_update_commit` 而非 `after_update`
+- 注释明确说明这是为了解决 Rails issue #20911（回调执行顺序问题）
+
+**Message 模型创建后回调链** (`app/models/message.rb:324-333`):
+```ruby
+def execute_after_create_commit_callbacks
+  # rails issue with order of active record callbacks being executed https://github.com/rails/rails/issues/20911
+  reopen_conversation
+  mark_pending_conversation_as_open_for_human_response
+  set_conversation_activity
+  dispatch_create_events
+  send_reply
+  execute_message_template_hooks
+  update_contact_activity
+end
+```
+
+**回调执行顺序**：
+1. `reopen_conversation` - 如果会话已 snoozed/resolved 则重新打开
+2. `mark_pending_conversation_as_open_for_human_response` - Capatain 待处理会话标记
+3. `set_conversation_activity` - 更新会话最后活动时间
+4. **`dispatch_create_events` - 触发 MESSAGE_CREATED 事件**
+5. `send_reply` - 异步发送消息到外部渠道
+6. `execute_message_template_hooks` - 执行消息模板钩子
+7. `update_contact_activity` - 更新联系人最后活动时间
+
+**dispatch_create_events 实现** (`app/models/message.rb:378-387`):
+```ruby
 def dispatch_create_events
   Rails.configuration.dispatcher.dispatch(MESSAGE_CREATED, Time.zone.now, message: self, performed_by: Current.executed_by)
-  
+
   if valid_first_reply?
     Rails.configuration.dispatcher.dispatch(FIRST_REPLY_CREATED, Time.zone.now, message: self, performed_by: Current.executed_by)
+    conversation.update(first_reply_created_at: created_at, waiting_since: nil)
+  else
+    update_waiting_since
   end
 end
+```
 
-after_update :send_update_event
+**消息更新回调** (`app/models/message.rb:389-395`):
+```ruby
+def dispatch_update_event
+  # ref: https://github.com/rails/rails/issues/44500
+  # we want to skip the update event if the message is not updated
+  return if previous_changes.blank?
 
-def send_update_event
-  Rails.configuration.dispatcher.dispatch(MESSAGE_UPDATED, Time.zone.now, message: self, previous_changes: previous_changes)
+  send_update_event
 end
 ```
 
 **Conversation 模型** (`app/models/conversation.rb:312-315`):
 ```ruby
 def dispatcher_dispatch(event_name, changed_attributes = nil)
-  Rails.configuration.dispatcher.dispatch(event_name, Time.zone.now, conversation: self, changed_attributes: changed_attributes)
-end
-```
-
-**Notification 模型** (`app/models/notification.rb:174-186`):
-```ruby
-after_create :dispatch_create_event
-after_update :dispatch_update_event
-after_destroy :dispatch_destroy_event
-
-def dispatch_create_event
-  Rails.configuration.dispatcher.dispatch(NOTIFICATION_CREATED, Time.zone.now, notification: self)
+  Rails.configuration.dispatcher.dispatch(event_name, Time.zone.now, conversation: self, changed_attributes: changed_attributes, performed_by: Current.executed_by)
 end
 ```
 
@@ -153,6 +183,7 @@ module Events::Types
   MESSAGE_CREATED = 'message.created'
   MESSAGE_UPDATED = 'message.updated'
   FIRST_REPLY_CREATED = 'first.reply.created'
+  REPLY_CREATED = 'reply.created'
   
   # 通知事件
   NOTIFICATION_CREATED = 'notification.created'
@@ -166,93 +197,17 @@ module Events::Types
   
   # 账户事件
   ACCOUNT_CACHE_INVALIDATED = 'account.cache_invalidated'
-  # ... 更多事件类型
+  
+  # Copilot 事件（企业版）
+  COPILOT_MESSAGE_CREATED = 'copilot.message.created'
 end
 ```
 
 ---
 
-### 3. 事件分发系统
+### 3. 事件名到监听方法的映射机制
 
-Chatwoot 使用 Wisper gem 实现发布-订阅模式，结合同步和异步两种分发机制。
-
-#### 3.1 Dispatcher 单例
-
-`app/dispatchers/dispatcher.rb`:
-```ruby
-class Dispatcher
-  include Singleton
-  
-  def initialize
-    @sync_dispatcher = SyncDispatcher.new
-    @async_dispatcher = AsyncDispatcher.new
-  end
-  
-  def dispatch(event_name, timestamp, data, _async = false)
-    @sync_dispatcher.dispatch(event_name, timestamp, data)
-    @async_dispatcher.dispatch(event_name, timestamp, data)
-  end
-end
-```
-
-#### 3.2 同步分发器 (SyncDispatcher)
-
-`app/dispatchers/sync_dispatcher.rb`:
-```ruby
-class SyncDispatcher < BaseDispatcher
-  include Wisper::Publisher
-  
-  def dispatch(event_name, timestamp, data)
-    event_object = Events::Base.new(event_name, timestamp, data)
-    publish(event_object.method_name, event_object)
-  end
-  
-  def listeners
-    [ActionCableListener.instance, AgentBotListener.instance]
-  end
-end
-```
-
-**关键点**：
-- 同步执行，实时性高
-- ActionCableListener 注册在这里，确保消息广播的低延迟
-
-#### 3.3 异步分发器 (AsyncDispatcher)
-
-`app/dispatchers/async_dispatcher.rb`:
-```ruby
-class AsyncDispatcher < BaseDispatcher
-  def dispatch(event_name, timestamp, data)
-    EventDispatcherJob.perform_later(event_name, timestamp, data)
-  end
-  
-  def publish_event(event_name, timestamp, data)
-    event_object = Events::Base.new(event_name, timestamp, data)
-    publish(event_object.method_name, event_object)
-  end
-  
-  def listeners
-    [
-      AutomationRuleListener.instance,
-      CampaignListener.instance,
-      WebhookListener.instance,
-      NotificationListener.instance,
-      # ... 其他监听器
-    ]
-  end
-end
-```
-
-**关键点**：
-- 通过 ActiveJob 异步执行
-- 不阻塞主请求流程
-- 用于 Webhook、自动化规则等耗时操作
-
----
-
-### 4. 事件名到监听方法的映射机制
-
-#### 4.1 事件名转换规则
+#### 3.1 事件名转换规则
 
 事件名通过 `Events::Base#method_name` 方法转换为监听方法名：
 
@@ -274,7 +229,7 @@ class Events::Base
 end
 ```
 
-**转换规则**：将事件名中的点号 `.` 替换为下划线 `_`
+**转换规则**：将事件名字符串中的点号 `.` 替换为下划线 `_`
 
 **映射示例**：
 | 事件常量 | 事件名字符串 | 监听方法名 |
@@ -284,7 +239,9 @@ end
 | `ACCOUNT_CACHE_INVALIDATED` | `'account.cache_invalidated'` | `account_cache_invalidated` |
 | `FIRST_REPLY_CREATED` | `'first.reply.created'` | `first_reply_created` |
 
-#### 4.2 Wisper 发布-订阅机制
+#### 3.2 Wisper 发布-订阅机制
+
+Chatwoot 使用 Wisper gem 实现发布-订阅模式。分发器通过继承 `BaseDispatcher` 获得 `Wisper::Publisher` 能力。
 
 `app/dispatchers/base_dispatcher.rb`:
 ```ruby
@@ -307,7 +264,101 @@ end
 3. Wisper 查找所有已订阅 listener 中同名方法
 4. 调用 `listener.message_created(event_object)`
 
-#### 4.3 监听器加载时机
+---
+
+### 4. 事件分发系统
+
+#### 4.1 Dispatcher 单例
+
+`app/dispatchers/dispatcher.rb`:
+```ruby
+class Dispatcher
+  include Singleton
+
+  attr_reader :async_dispatcher, :sync_dispatcher
+
+  def self.dispatch(event_name, timestamp, data, async = false)
+    Rails.configuration.dispatcher.dispatch(event_name, timestamp, data, async)
+  end
+
+  def initialize
+    @sync_dispatcher = SyncDispatcher.new
+    @async_dispatcher = AsyncDispatcher.new
+  end
+
+  def dispatch(event_name, timestamp, data, _async = false)
+    @sync_dispatcher.dispatch(event_name, timestamp, data)
+    @async_dispatcher.dispatch(event_name, timestamp, data)
+  end
+
+  def load_listeners
+    @sync_dispatcher.load_listeners
+    @async_dispatcher.load_listeners
+  end
+end
+```
+
+#### 4.2 同步分发器 (SyncDispatcher)
+
+`app/dispatchers/sync_dispatcher.rb`:
+```ruby
+class SyncDispatcher < BaseDispatcher
+  def dispatch(event_name, timestamp, data)
+    event_object = Events::Base.new(event_name, timestamp, data)
+    publish(event_object.method_name, event_object)
+  end
+
+  def listeners
+    [ActionCableListener.instance, AgentBotListener.instance]
+  end
+end
+```
+
+**关键点**：
+- 继承 `BaseDispatcher`，通过继承获得 `Wisper::Publisher` 能力
+- 同步执行，实时性高
+- `ActionCableListener` 注册在这里，确保消息广播的低延迟
+
+#### 4.3 异步分发器 (AsyncDispatcher)
+
+`app/dispatchers/async_dispatcher.rb`:
+```ruby
+class AsyncDispatcher < BaseDispatcher
+  def dispatch(event_name, timestamp, data)
+    EventDispatcherJob.perform_later(event_name, timestamp, data)
+  end
+
+  def publish_event(event_name, timestamp, data)
+    event_object = Events::Base.new(event_name, timestamp, data)
+    publish(event_object.method_name, event_object)
+  end
+
+  def listeners
+    [
+      AutomationRuleListener.instance,
+      CampaignListener.instance,
+      CsatSurveyListener.instance,
+      HookListener.instance,
+      InstallationWebhookListener.instance,
+      NotificationListener.instance,
+      ParticipationListener.instance,
+      ReportingEventListener.instance,
+      WebhookListener.instance
+    ]
+  end
+end
+
+AsyncDispatcher.prepend_mod_with('AsyncDispatcher')
+```
+
+**关键点**：
+- 通过 `EventDispatcherJob` 异步执行
+- 不阻塞主请求流程
+- 用于 Webhook、自动化规则等耗时操作
+
+---
+
+### 5. 监听器加载时机
 
 监听器在 Rails 应用启动时通过 `config.to_prepare` 加载：
 
@@ -347,113 +398,9 @@ end
 
 ---
 
-### 5. 同步分发与消息回调真实触发点
+### 6. 同步分发与消息回调真实触发点
 
-#### 5.1 Message 模型回调链
-
-Message 模型使用 `after_create_commit` 确保数据持久化后再触发事件：
-
-`app/models/message.rb:137-139`:
-```ruby
-after_create_commit :execute_after_create_commit_callbacks
-after_update_commit :dispatch_update_event
-after_commit :reindex_for_search, if: :should_index?, on: [:create, :update]
-```
-
-**为什么使用 `after_create_commit` 而不是 `after_create`？**
-
-`app/models/message.rb:324-333`:
-```ruby
-def execute_after_create_commit_callbacks
-  # rails issue with order of active record callbacks being executed https://github.com/rails/rails/issues/20911
-  reopen_conversation
-  mark_pending_conversation_as_open_for_human_response
-  set_conversation_activity
-  dispatch_create_events  # ← 触发 MESSAGE_CREATED 事件
-  send_reply
-  execute_message_template_hooks
-  update_contact_activity
-end
-```
-
-**回调执行顺序**：
-1. 数据库事务提交（消息已持久化）
-2. `after_create_commit` 触发
-3. `execute_after_create_commit_callbacks` 按顺序执行：
-   - `reopen_conversation` - 如果会话已 snoozed/resolved 则重新打开
-   - `mark_pending_conversation_as_open_for_human_response` - Capatain 待处理会话标记
-   - `set_conversation_activity` - 更新会话最后活动时间
-   - `dispatch_create_events` - **触发 MESSAGE_CREATED 事件**
-   - `send_reply` - 异步发送消息到外部渠道
-   - `execute_message_template_hooks` - 执行消息模板钩子
-   - `update_contact_activity` - 更新联系人最后活动时间
-
-#### 5.2 dispatch_create_events 详解
-
-`app/models/message.rb:378-387`:
-```ruby
-def dispatch_create_events
-  Rails.configuration.dispatcher.dispatch(MESSAGE_CREATED, Time.zone.now, message: self, performed_by: Current.executed_by)
-
-  if valid_first_reply?
-    Rails.configuration.dispatcher.dispatch(FIRST_REPLY_CREATED, Time.zone.now, message: self, performed_by: Current.executed_by)
-    conversation.update(first_reply_created_at: created_at, waiting_since: nil)
-  else
-    update_waiting_since
-  end
-end
-```
-
-**事件触发逻辑**：
-1. **无条件触发** `MESSAGE_CREATED` 事件
-2. **检查是否为首条回复** (`valid_first_reply?`)
-   - 如果是：触发 `FIRST_REPLY_CREATED` 事件，更新会话 `first_reply_created_at`
-   - 如果不是：调用 `update_waiting_since`
-
-#### 5.3 update_waiting_since 额外事件
-
-`app/models/message.rb:344-360`:
-```ruby
-def clear_waiting_since_on_outgoing_response
-  if human_response?
-    Rails.configuration.dispatcher.dispatch(
-      REPLY_CREATED, Time.zone.now, waiting_since: conversation.waiting_since, message: self
-    )
-    conversation.update(waiting_since: nil)
-    return
-  end
-
-  conversation.update(waiting_since: nil) if bot_response? && !preserve_waiting_since
-end
-
-def set_waiting_since_on_incoming_message
-  conversation.update(waiting_since: created_at) if incoming? && conversation.waiting_since.blank?
-end
-```
-
-**可能触发的额外事件**：
-- `REPLY_CREATED` - 当客服发送人类回复时触发
-
-#### 5.4 更新事件触发
-
-`app/models/message.rb:389-395`:
-```ruby
-def dispatch_update_event
-  # ref: https://github.com/rails/rails/issues/44500
-  # we want to skip the update event if the message is not updated
-  return if previous_changes.blank?
-
-  send_update_event
-end
-```
-
-**关键点**：
-- 使用 `after_update_commit` 确保数据已保存
-- 检查 `previous_changes.blank?` 避免空更新触发事件
-
-#### 5.5 同步分发执行时机
-
-**完整时序图（消息创建场景）**：
+#### 6.1 Message 模型完整时序图（消息创建场景）
 
 ```
 HTTP 请求
@@ -491,18 +438,43 @@ execute_after_create_commit_callbacks
 HTTP 响应返回
 ```
 
-**重要结论**：
-1. **同步分发在 HTTP 请求线程内执行**，但 `ActionCableListener` 只创建 `perform_later` Job，不阻塞太久
+#### 6.2 重要结论
+
+1. **同步分发在 HTTP 请求线程内执行**，但 `ActionCableListener` 只创建 `perform_later` Job，实际广播由 Sidekiq 异步处理
 2. **事件触发在事务提交之后**，确保监听器看到的数据是已持久化的
-3. **`dispatch_create_events` 可能触发多个事件**：`MESSAGE_CREATED`、`FIRST_REPLY_CREATED`、`REPLY_CREATED`
+3. **`dispatch_create_events` 可能触发多个事件**：
+   - `MESSAGE_CREATED` - 无条件触发
+   - `FIRST_REPLY_CREATED` - 首条回复时触发
+   - `REPLY_CREATED` - 人类回复时由 `update_waiting_since` 触发
+
+#### 6.3 update_waiting_since 额外事件
+
+`app/models/message.rb:344-360`:
+```ruby
+def clear_waiting_since_on_outgoing_response
+  if human_response?
+    Rails.configuration.dispatcher.dispatch(
+      REPLY_CREATED, Time.zone.now, waiting_since: conversation.waiting_since, message: self
+    )
+    conversation.update(waiting_since: nil)
+    return
+  end
+
+  conversation.update(waiting_since: nil) if bot_response? && !preserve_waiting_since
+end
+
+def set_waiting_since_on_incoming_message
+  conversation.update(waiting_since: created_at) if incoming? && conversation.waiting_since.blank?
+end
+```
 
 ---
 
-### 6. 企业版扩展监听
+### 7. 企业版扩展监听
 
 Chatwoot 企业版通过 `prepend` 机制扩展 OSS 版的监听器功能。
 
-#### 6.1 企业版模块注入机制
+#### 7.1 企业版模块注入机制
 
 `config/initializers/01_inject_enterprise_edition_module.rb`:
 ```ruby
@@ -536,12 +508,13 @@ module InjectEnterpriseEditionModule
 end
 ```
 
-#### 6.2 ActionCableListener 企业版扩展
+#### 7.2 ActionCableListener 企业版扩展
 
 OSS 版在文件末尾声明：
-`app/listeners/action_cable_listener.rb:223-224`:
+`app/listeners/action_cable_listener.rb:224-225`:
 ```ruby
 end
+
 ActionCableListener.prepend_mod_with('ActionCableListener')
 ```
 
@@ -561,11 +534,6 @@ module Enterprise::ActionCableListener
 end
 ```
 
-**企业版新增事件类型** (`lib/events/types.rb`):
-```ruby
-COPILOT_MESSAGE_CREATED = 'copilot.message.created'
-```
-
 **扩展原理**：
 1. 启动时 `ActionCableListener.prepend_mod_with('ActionCableListener')` 被调用
 2. 查找 `Enterprise::ActionCableListener` 模块
@@ -576,390 +544,23 @@ COPILOT_MESSAGE_CREATED = 'copilot.message.created'
    ```
 5. OSS 版的 `broadcast` 方法可被企业版调用
 
-#### 6.3 企业版扩展模式的优势
-
+**企业版扩展模式的优势**：
 - **无侵入修改**：不需要修改 OSS 代码
 - **方法可叠加**：企业版可以新增方法，也可以通过 `super` 覆盖 OSS 方法
 - **延迟加载**：`to_prepare` 确保代码重载后重新注入
 
 ---
 
-### 7. 前端重连机制
-
-#### 7.1 基础连接器重连逻辑
-
-`app/javascript/shared/helpers/BaseActionCableConnector.js`:
-```javascript
-const RECONNECT_INTERVAL = 1000;
-
-class BaseActionCableConnector {
-  static isDisconnected = false;
-
-  constructor(app, pubsubToken, websocketHost = '', presenceInterval = PRESENCE_INTERVAL) {
-    // ...
-    this.subscription = this.consumer.subscriptions.create(
-      {
-        channel: 'RoomChannel',
-        pubsub_token: pubsubToken,
-        account_id: app.$store.getters.getCurrentAccountId,
-        user_id: app.$store.getters.getCurrentUserID,
-      },
-      {
-        received: this.onReceived,
-        disconnected: () => {
-          BaseActionCableConnector.isDisconnected = true;
-          this.onDisconnected();
-          this.initReconnectTimer();  // ← 断开后启动重连定时器
-        },
-      }
-    );
-    this.reconnectTimer = null;
-  }
-
-  checkConnection() {
-    const isConnectionActive = this.consumer.connection.isOpen();
-    const isReconnected =
-      BaseActionCableConnector.isDisconnected && isConnectionActive;
-    if (isReconnected) {
-      this.clearReconnectTimer();
-      this.onReconnect();  // ← 重连成功回调
-      BaseActionCableConnector.isDisconnected = false;
-    } else {
-      this.initReconnectTimer();  // ← 继续检查
-    }
-  }
-
-  clearReconnectTimer = () => {
-    if (this.reconnectTimer) {
-      clearTimeout(this.reconnectTimer);
-      this.reconnectTimer = null;
-    }
-  };
-
-  initReconnectTimer = () => {
-    this.clearReconnectTimer();
-    this.reconnectTimer = setTimeout(() => {
-      this.checkConnection();
-    }, RECONNECT_INTERVAL);
-  };
-
-  onReconnect = () => {};
-  onDisconnected = () => {};
-}
-```
-
-**重连流程**：
-```
-WebSocket 连接断开
-    ↓
-disconnected 回调触发
-    ↓
-isDisconnected = true
-    ↓
-initReconnectTimer()
-    ↓
-setTimeout(checkConnection, 1000ms)
-    ↓
-checkConnection()
-    ├── isConnectionActive?
-    │   ├── YES → 调用 onReconnect() → 结束
-    │   └── NO  → initReconnectTimer() → 循环
-    ↓
-ActionCable 内部自动重连 (由 @rails/actioncable 库处理)
-```
-
-#### 7.2 客服面板重连处理
-
-`app/javascript/dashboard/helper/actionCable.js`:
-```javascript
-import { BUS_EVENTS } from 'shared/constants/busEvents';
-import { emitter } from 'shared/helpers/mitt';
-
-class ActionCableConnector extends BaseActionCableConnector {
-  onReconnect = () => {
-    emitter.emit(BUS_EVENTS.WEBSOCKET_RECONNECT);
-  };
-
-  onDisconnected = () => {
-    emitter.emit(BUS_EVENTS.WEBSOCKET_DISCONNECT);
-  };
-}
-```
-
-**客服面板重连影响**：
-- 发送 `WEBSOCKET_RECONNECT` 事件通知全局
-- 应用可能需要刷新部分数据
-- 在线状态会通过 `triggerPresenceInterval` 自动恢复
-
-#### 7.3 访客 Widget 重连处理
-
-`app/javascript/widget/helpers/actionCable.js`:
-```javascript
-class ActionCableConnector extends BaseActionCableConnector {
-  onDisconnected = () => {
-    this.setLastMessageId();  // ← 记录断开时的最后消息 ID
-  };
-
-  onReconnect = () => {
-    this.syncLatestMessages();  // ← 重连后同步缺失消息
-  };
-
-  setLastMessageId = () => {
-    this.app.$store.dispatch('conversation/setLastMessageId');
-  };
-
-  syncLatestMessages = () => {
-    this.app.$store.dispatch('conversation/syncLatestMessages');
-  };
-}
-```
-
-**访客 Widget 重连策略**：
-1. **断开时**：保存当前最后一条消息 ID
-2. **重连后**：调用 API 同步断开期间的消息
-3. **保证消息不丢失**：通过 HTTP API 补全 WebSocket 断开期间的消息
-
-#### 7.4 重连对多坐席同步的影响
-
-**潜在问题场景**：
-```
-客服A发送消息
-    ↓
-客服B的WebSocket短暂断开 (网络抖动)
-    ↓
-Redis Pub/Sub 广播 MESSAGE_CREATED
-    ↓
-客服B的Rails实例收到消息，但找不到WebSocket连接
-    ↓
-消息丢失
-    ↓
-客服B重连成功
-    ↓
-客服B需要重新获取最新数据
-```
-
-**当前处理方式**：
-| 角色 | 重连后处理 | 潜在消息丢失 |
-|-----|-----------|-------------|
-| 客服面板 | 发送 `WEBSOCKET_RECONNECT` 事件 | 可能需要手动刷新 |
-| 访客 Widget | `syncLatestMessages()` HTTP 补全 | 不会丢失 |
-
-**改进空间**：
-- 客服面板也应该实现类似 Widget 的消息同步机制
-- 或者使用消息队列/持久化确保重连后消息可达
-
----
-
-### 8. 在线状态更新机制
-
-#### 8.1 OnlineStatusTracker 核心实现
-
-`lib/online_status_tracker.rb`:
-```ruby
-class OnlineStatusTracker
-  PRESENCE_DURATION = ENV.fetch('PRESENCE_DURATION', 20).to_i.seconds
-  CONTACT_PRESENCE_DURATION = ENV.fetch('CONTACT_PRESENCE_DURATION', 90).to_i.seconds
-
-  # presence: sorted set with timestamp as the score & object id as value
-  # online status: hash with obj_id key && status as value
-
-  def self.update_presence(account_id, obj_type, obj_id)
-    ::Redis::Alfred.zadd(presence_key(account_id, obj_type), Time.now.to_i, obj_id)
-  end
-
-  def self.get_available_users(account_id)
-    user_ids = get_available_user_ids(account_id)
-    return {} if user_ids.blank?
-
-    user_availabilities = ::Redis::Alfred.hmget(status_key(account_id), user_ids)
-    user_ids.map.with_index { |id, index| 
-      [id, (user_availabilities[index] || get_availability_from_db(account_id, id))] 
-    }.to_h
-  end
-
-  def self.get_available_user_ids(account_id)
-    account = Account.find(account_id)
-    range_start = (Time.zone.now - PRESENCE_DURATION).to_i
-    user_ids = ::Redis::Alfred.zrangebyscore(presence_key(account_id, 'User'), range_start, '+inf')
-    user_ids += account.account_users.where(auto_offline: false)&.map(&:user_id)&.map(&:to_s)
-    user_ids.uniq
-  end
-
-  def self.get_available_contacts(account_id)
-    get_available_contact_ids(account_id).index_with { |_id| 'online' }
-  end
-
-  def self.presence_key(account_id, type)
-    case type
-    when 'Contact'
-      format(::Redis::Alfred::ONLINE_PRESENCE_CONTACTS, account_id: account_id)
-    else
-      format(::Redis::Alfred::ONLINE_PRESENCE_USERS, account_id: account_id)
-    end
-  end
-
-  def self.status_key(account_id)
-    format(::Redis::Alfred::ONLINE_STATUS, account_id: account_id)
-  end
-end
-```
-
-**Redis 数据结构**：
-| Key 类型 | Redis 结构 | 用途 |
-|---------|-----------|------|
-| `ONLINE_PRESENCE_USERS::{account_id}` | Sorted Set | 客服在线 presence（score=timestamp, member=user_id） |
-| `ONLINE_PRESENCE_CONTACTS::{account_id}` | Sorted Set | 访客在线 presence |
-| `ONLINE_STATUS::{account_id}` | Hash | 客服可用性状态（online/busy/offline） |
-
-**时间窗口配置**：
-- **客服 (User)**：`PRESENCE_DURATION = 20s`（前端每 20s ping 一次）
-- **访客 (Contact)**：`CONTACT_PRESENCE_DURATION = 90s`（Widget 每 60s ping 一次）
-
-#### 8.2 RoomChannel 在线状态更新
-
-`app/channels/room_channel.rb`:
-```ruby
-class RoomChannel < ApplicationCable::Channel
-  def subscribed
-    current_user
-    current_account
-    ensure_stream
-    update_subscription  # ← 订阅时更新 presence
-    broadcast_presence   # ← 立即广播一次
-  end
-
-  def update_presence
-    update_subscription
-    broadcast_presence
-  end
-
-  private
-
-  def broadcast_presence
-    return if @current_account.blank?
-
-    data = { account_id: @current_account.id, users: ::OnlineStatusTracker.get_available_users(@current_account.id) }
-    data[:contacts] = ::OnlineStatusTracker.get_available_contacts(@current_account.id) if @current_user.is_a? User
-    ActionCable.server.broadcast(pubsub_token, { event: 'presence.update', data: data })
-  end
-
-  def update_subscription
-    return if @current_account.blank?
-    ::OnlineStatusTracker.update_presence(@current_account.id, @current_user.class.name, @current_user.id)
-  end
-end
-```
-
-#### 8.3 前端定时心跳
-
-**客服面板** (`app/javascript/shared/helpers/BaseActionCableConnector.js`):
-```javascript
-const PRESENCE_INTERVAL = 20000;  // 20秒
-
-class BaseActionCableConnector {
-  constructor(...) {
-    // ...
-    this.triggerPresenceInterval = () => {
-      setTimeout(() => {
-        this.subscription.updatePresence();  // 调用 RoomChannel#update_presence
-        this.triggerPresenceInterval();
-      }, presenceInterval);
-    };
-    this.triggerPresenceInterval();
-  }
-}
-```
-
-**访客 Widget** 使用 60 秒间隔。
-
-#### 8.4 前端处理 presence.update
-
-**客服面板** (`app/javascript/dashboard/helper/actionCable.js`):
-```javascript
-import { useImpersonation } from 'dashboard/composables/useImpersonation';
-const { isImpersonating } = useImpersonation();
-
-onPresenceUpdate = data => {
-  if (isImpersonating.value) return;  // 模拟用户时不更新
-  this.app.$store.dispatch('contacts/updatePresence', data.contacts);
-  this.app.$store.dispatch('agents/updatePresence', data.users);
-  this.app.$store.dispatch('setCurrentUserAvailability', data.users);
-};
-```
-
-**访客 Widget** (`app/javascript/widget/helpers/actionCable.js`):
-```javascript
-onPresenceUpdate = data => {
-  this.app.$store.dispatch('agent/updatePresence', data.users);
-};
-```
-
-#### 8.5 在线状态对多坐席同步的影响
-
-**完整在线状态同步流程**：
-```
-客服A登录，建立WebSocket连接
-    ↓
-RoomChannel#subscribed
-    ├── update_subscription → Redis ZADD 更新 presence
-    └── broadcast_presence → 向客服A自己发送 presence.update
-    ↓
-客服A每20秒触发一次 updatePresence
-    ├── update_subscription → 刷新 Redis 中的时间戳
-    └── broadcast_presence → 广播最新在线列表
-    ↓
-客服B收到 presence.update
-    ↓
-Store 更新 agents/updatePresence
-    ↓
-UI 显示客服A在线
-```
-
-**跨实例在线状态共享**：
-```
-客服A连接到 Rails 实例 A
-    ↓
-实例 A: ZADD ONLINE_PRESENCE_USERS::1 1715000000 123
-    ↓
-客服B连接到 Rails 实例 B
-    ↓
-实例 B: ZRANGEBYSCORE ONLINE_PRESENCE_USERS::1 (20秒前) +inf
-    ↓
-获取到 [123] (客服A的ID)
-    ↓
-客服B的 presence.update 包含客服A在线
-```
-
-**关键点**：
-- 在线状态完全通过 Redis 共享，不依赖 Rails 实例
-- 每个用户定时心跳刷新自己的时间戳
-- `broadcast_presence` 是向 **个人 stream** 发送，不是全局广播
-- 这意味着每个用户看到的在线列表是自己查询 Redis 后组装的
-
-**潜在问题**：
-1. **心跳间隔 vs 超时窗口**：
-   - 客服心跳 20s，超时窗口 20s → 理论上刚好
-   - 网络延迟可能导致短暂显示离线
-2. **无全局广播**：
-   - 客服A下线后，客服B不会立即收到通知
-   - 客服B需要等自己的下一次心跳 (最多 20s) 才能看到变化
-3. **Redis Sorted Set 清理**：
-   - `get_available_user_ids` 每次查询时清理过期数据
-   - 还有 `RemoveStaleRedisKeysJob` 定期清理
-
----
-
-### 9. ActionCableListener 核心实现
+### 8. ActionCableListener 核心实现
 
 `app/listeners/action_cable_listener.rb` 是连接事件系统和 ActionCable 广播的核心组件。
 
-#### 9.1 事件处理方法示例
+#### 8.1 事件处理方法示例
 
 ```ruby
 def message_created(event)
   message, account = extract_message_and_account(event)
   conversation = message.conversation
-  # 确定需要接收消息的用户 tokens
   tokens = user_tokens(account, conversation.inbox.members) + contact_tokens(conversation.contact_inbox, message)
   
   broadcast(account, tokens, MESSAGE_CREATED, message.push_event_data)
@@ -979,7 +580,7 @@ def conversation_typing_on(event)
 end
 ```
 
-#### 9.2 Token 计算逻辑
+#### 8.2 Token 计算逻辑
 
 ```ruby
 def user_tokens(account, agents)
@@ -1010,7 +611,7 @@ end
 - **私有消息**：不会广播给访客
 - **HMAC 验证**：已验证的访客会广播到所有验证过的 contact_inboxes
 
-#### 9.3 核心广播方法
+#### 8.3 核心广播方法
 
 `app/listeners/action_cable_listener.rb:213-222`:
 ```ruby
@@ -1026,7 +627,7 @@ end
 
 ---
 
-### 10. ActionCableBroadcastJob
+### 9. ActionCableBroadcastJob
 
 `app/jobs/action_cable_broadcast_job.rb` 负责将消息通过 ActionCable 广播出去。
 
@@ -1081,9 +682,9 @@ end
 
 ---
 
-### 11. Redis 在跨实例消息分发中的角色
+### 10. Redis 在跨实例消息分发中的角色
 
-#### 11.1 ActionCable Redis 适配器配置
+#### 10.1 ActionCable Redis 适配器配置
 
 `config/cable.yml`:
 ```yaml
@@ -1094,7 +695,7 @@ default: &default
   channel_prefix: <%= "chatwoot_#{Rails.env}_action_cable" %>
 ```
 
-#### 11.2 自定义 Redis 连接
+#### 10.2 自定义 Redis 连接
 
 `config/initializers/actioncable.rb`:
 ```ruby
@@ -1106,7 +707,7 @@ ActionCable::SubscriptionAdapter::Redis.redis_connector = lambda do |config|
 end
 ```
 
-#### 11.3 Redis Pub/Sub 工作原理
+#### 10.3 Redis Pub/Sub 工作原理
 
 当调用 `ActionCable.server.broadcast(stream_name, message)` 时：
 
@@ -1148,44 +749,68 @@ end
 
 ---
 
-### 12. ActionCable 频道 (RoomChannel)
+### 11. ActionCable 频道 (RoomChannel)
 
 `app/channels/room_channel.rb` 是客户端订阅的唯一频道。
 
 ```ruby
 class RoomChannel < ApplicationCable::Channel
   def subscribed
+    # TODO: should we only do ensure stream  if current account is present?
+    # for now going ahead with guard clauses in update_subscription and broadcast_presence
     current_user
     current_account
     ensure_stream
     update_subscription
     broadcast_presence
   end
-  
+
+  def update_presence
+    update_subscription
+    broadcast_presence
+  end
+
   private
-  
+
+  def broadcast_presence
+    return if @current_account.blank?
+
+    data = { account_id: @current_account.id, users: ::OnlineStatusTracker.get_available_users(@current_account.id) }
+    data[:contacts] = ::OnlineStatusTracker.get_available_contacts(@current_account.id) if @current_user.is_a? User
+    ActionCable.server.broadcast(pubsub_token, { event: 'presence.update', data: data })
+  end
+
   def ensure_stream
-    # 订阅个人 stream
     stream_from pubsub_token
-    # 客服额外订阅账户级别 stream
     stream_from "account_#{@current_account.id}" if @current_account.present? && @current_user.is_a?(User)
   end
-  
+
   def update_subscription
     return if @current_account.blank?
+
     ::OnlineStatusTracker.update_presence(@current_account.id, @current_user.class.name, @current_user.id)
   end
-  
+
   def pubsub_token
     @pubsub_token ||= params[:pubsub_token]
   end
-  
+
   def current_user
     @current_user ||= if params[:user_id].blank?
                         ContactInbox.find_by!(pubsub_token: pubsub_token).contact
                       else
                         User.find_by!(pubsub_token: pubsub_token, id: params[:user_id])
                       end
+  end
+
+  def current_account
+    return if current_user.blank?
+
+    @current_account ||= if @current_user.is_a? Contact
+                           @current_user.account
+                         else
+                           @current_user.accounts.find(params[:account_id])
+                         end
   end
 end
 ```
@@ -1197,6 +822,144 @@ end
 
 ---
 
+### 12. 在线状态更新机制
+
+#### 12.1 OnlineStatusTracker 核心实现
+
+`lib/online_status_tracker.rb`:
+```ruby
+class OnlineStatusTracker
+  # NOTE: You can customise the environment variable to keep your agents/contacts as online for longer
+  PRESENCE_DURATION = ENV.fetch('PRESENCE_DURATION', 20).to_i.seconds
+  # Widget pings every 60s, so contacts need a longer presence window
+  CONTACT_PRESENCE_DURATION = ENV.fetch('CONTACT_PRESENCE_DURATION', 90).to_i.seconds
+
+  # presence : sorted set with timestamp as the score & object id as value
+  # online status : online | busy | offline
+  # redis hash with obj_id key && status as value
+
+  def self.update_presence(account_id, obj_type, obj_id)
+    ::Redis::Alfred.zadd(presence_key(account_id, obj_type), Time.now.to_i, obj_id)
+  end
+
+  def self.get_available_users(account_id)
+    user_ids = get_available_user_ids(account_id)
+    return {} if user_ids.blank?
+
+    user_availabilities = ::Redis::Alfred.hmget(status_key(account_id), user_ids)
+    user_ids.map.with_index { |id, index| [id, (user_availabilities[index] || get_availability_from_db(account_id, id))] }.to_h
+  end
+
+  def self.get_available_user_ids(account_id)
+    account = Account.find(account_id)
+    range_start = (Time.zone.now - PRESENCE_DURATION).to_i
+    user_ids = ::Redis::Alfred.zrangebyscore(presence_key(account_id, 'User'), range_start, '+inf')
+    # since we are dealing with redis items as string, casting to string
+    user_ids += account.account_users.where(auto_offline: false)&.map(&:user_id)&.map(&:to_s)
+    user_ids.uniq
+  end
+
+  def self.get_available_contacts(account_id)
+    get_available_contact_ids(account_id).index_with { |_id| 'online' }
+  end
+
+  def self.presence_key(account_id, type)
+    case type
+    when 'Contact'
+      format(::Redis::Alfred::ONLINE_PRESENCE_CONTACTS, account_id: account_id)
+    else
+      format(::Redis::Alfred::ONLINE_PRESENCE_USERS, account_id: account_id)
+    end
+  end
+
+  def self.status_key(account_id)
+    format(::Redis::Alfred::ONLINE_STATUS, account_id: account_id)
+  end
+end
+```
+
+**Redis 数据结构**：
+| Key 类型 | Redis 结构 | 用途 |
+|---------|-----------|------|
+| `ONLINE_PRESENCE_USERS::{account_id}` | Sorted Set | 客服在线 presence（score=timestamp, member=user_id） |
+| `ONLINE_PRESENCE_CONTACTS::{account_id}` | Sorted Set | 访客在线 presence |
+| `ONLINE_STATUS::{account_id}` | Hash | 客服可用性状态（online/busy/offline） |
+
+**时间窗口配置**：
+- **客服 (User)**：`PRESENCE_DURATION = 20s`（前端每 20s ping 一次）
+- **访客 (Contact)**：`CONTACT_PRESENCE_DURATION = 90s`（Widget 每 60s ping 一次）
+
+#### 12.2 前端定时心跳
+
+`app/javascript/shared/helpers/BaseActionCableConnector.js`:
+```javascript
+const PRESENCE_INTERVAL = 20000;  // 20秒
+
+class BaseActionCableConnector {
+  constructor(...) {
+    // ...
+    this.triggerPresenceInterval = () => {
+      setTimeout(() => {
+        this.subscription.updatePresence();  // 调用 RoomChannel#update_presence
+        this.triggerPresenceInterval();
+      }, presenceInterval);
+    };
+    this.triggerPresenceInterval();
+  }
+}
+```
+
+**访客 Widget** 使用 60 秒间隔（`WIDGET_PRESENCE_INTERVAL = 60000`）。
+
+#### 12.3 在线状态对多坐席同步的影响
+
+**完整在线状态同步流程**：
+```
+客服A登录，建立WebSocket连接
+    ↓
+RoomChannel#subscribed
+    ├── update_subscription → Redis ZADD 更新 presence
+    └── broadcast_presence → 向客服A自己发送 presence.update
+    ↓
+客服A每20秒触发一次 updatePresence
+    ├── update_subscription → 刷新 Redis 中的时间戳
+    └── broadcast_presence → 向个人 stream 广播最新在线列表
+    ↓
+客服B收到 presence.update
+    ↓
+Store 更新 agents/updatePresence
+    ↓
+UI 显示客服A在线
+```
+
+**跨实例在线状态共享**：
+```
+客服A连接到 Rails 实例 A
+    ↓
+实例 A: ZADD ONLINE_PRESENCE_USERS::1 1715000000 123
+    ↓
+客服B连接到 Rails 实例 B
+    ↓
+实例 B: ZRANGEBYSCORE ONLINE_PRESENCE_USERS::1 (20秒前) +inf
+    ↓
+获取到 [123] (客服A的ID)
+    ↓
+客服B的 presence.update 包含客服A在线
+```
+
+**关键点**：
+- 在线状态完全通过 Redis 共享，不依赖 Rails 实例
+- 每个用户定时心跳刷新自己的时间戳
+- `broadcast_presence` 是向 **个人 stream** 发送，不是全局广播
+- 每个用户看到的在线列表是自己查询 Redis 后组装的
+
+**潜在问题**：
+1. **心跳间隔 vs 超时窗口**：客服心跳 20s，超时窗口 20s，网络延迟可能导致短暂显示离线
+2. **无全局广播**：客服A下线后，客服B不会立即收到通知，需等待自己的下一次心跳（最多 20s）
+3. **Redis Sorted Set 清理**：`get_available_user_ids` 每次查询时清理过期数据
+
+---
+
 ### 13. 前端 WebSocket 连接
 
 #### 13.1 基础连接器
@@ -1205,10 +968,20 @@ end
 ```javascript
 import { createConsumer } from '@rails/actioncable';
 
+const PRESENCE_INTERVAL = 20000;
+const RECONNECT_INTERVAL = 1000;
+
 class BaseActionCableConnector {
-  constructor(app, pubsubToken, websocketHost = '') {
+  static isDisconnected = false;
+
+  constructor(
+    app,
+    pubsubToken,
+    websocketHost = '',
+    presenceInterval = PRESENCE_INTERVAL
+  ) {
     const websocketURL = websocketHost ? `${websocketHost}/cable` : undefined;
-    
+
     this.consumer = createConsumer(websocketURL);
     this.subscription = this.consumer.subscriptions.create(
       {
@@ -1223,15 +996,59 @@ class BaseActionCableConnector {
         },
         received: this.onReceived,
         disconnected: () => {
+          BaseActionCableConnector.isDisconnected = true;
           this.onDisconnected();
           this.initReconnectTimer();
         },
       }
     );
-    
+    this.app = app;
+    this.events = {};
+    this.reconnectTimer = null;
+    this.isAValidEvent = () => true;
+    this.triggerPresenceInterval = () => {
+      setTimeout(() => {
+        this.subscription.updatePresence();
+        this.triggerPresenceInterval();
+      }, presenceInterval);
+    };
     this.triggerPresenceInterval();
   }
-  
+
+  checkConnection() {
+    const isConnectionActive = this.consumer.connection.isOpen();
+    const isReconnected =
+      BaseActionCableConnector.isDisconnected && isConnectionActive;
+    if (isReconnected) {
+      this.clearReconnectTimer();
+      this.onReconnect();
+      BaseActionCableConnector.isDisconnected = false;
+    } else {
+      this.initReconnectTimer();
+    }
+  }
+
+  clearReconnectTimer = () => {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  };
+
+  initReconnectTimer = () => {
+    this.clearReconnectTimer();
+    this.reconnectTimer = setTimeout(() => {
+      this.checkConnection();
+    }, RECONNECT_INTERVAL);
+  };
+
+  onReconnect = () => {};
+  onDisconnected = () => {};
+
+  disconnect() {
+    this.consumer.disconnect();
+  }
+
   onReceived = ({ event, data } = {}) => {
     if (this.isAValidEvent(data)) {
       if (this.events[event] && typeof this.events[event] === 'function') {
@@ -1240,6 +1057,8 @@ class BaseActionCableConnector {
     }
   };
 }
+
+export default BaseActionCableConnector;
 ```
 
 #### 13.2 客服面板连接器
@@ -1259,10 +1078,21 @@ class ActionCableConnector extends BaseActionCableConnector {
       'conversation.typing_on': this.onTypingOn,
       'conversation.typing_off': this.onTypingOff,
       'presence.update': this.onPresenceUpdate,
-      // ... 更多事件
+      'notification.created': this.onNotificationCreated,
+      'conversation.mentioned': this.onConversationMentioned,
+      'account.cache_invalidated': this.onCacheInvalidate,
+      'copilot.message.created': this.onCopilotMessageCreated,
     };
   }
-  
+
+  onReconnect = () => {
+    emitter.emit(BUS_EVENTS.WEBSOCKET_RECONNECT);
+  };
+
+  onDisconnected = () => {
+    emitter.emit(BUS_EVENTS.WEBSOCKET_DISCONNECT);
+  };
+
   onMessageCreated = data => {
     DashboardAudioNotificationHelper.onNewMessage(data);
     this.app.$store.dispatch('addMessage', data);
@@ -1271,12 +1101,12 @@ class ActionCableConnector extends BaseActionCableConnector {
       conversationId: data.conversation_id,
     });
   };
-  
-  onTypingOn = ({ conversation, user }) => {
-    this.app.$store.dispatch('conversationTypingStatus/create', {
-      conversationId: conversation.id,
-      user,
-    });
+
+  onPresenceUpdate = data => {
+    if (isImpersonating.value) return;
+    this.app.$store.dispatch('contacts/updatePresence', data.contacts);
+    this.app.$store.dispatch('agents/updatePresence', data.users);
+    this.app.$store.dispatch('setCurrentUserAvailability', data.users);
   };
 }
 ```
@@ -1285,24 +1115,104 @@ class ActionCableConnector extends BaseActionCableConnector {
 
 `app/javascript/widget/helpers/actionCable.js`:
 ```javascript
+const WIDGET_PRESENCE_INTERVAL = 60000;
+
 class ActionCableConnector extends BaseActionCableConnector {
   constructor(app, pubsubToken) {
-    super(app, pubsubToken);
+    super(app, pubsubToken, '', WIDGET_PRESENCE_INTERVAL);
     
     this.events = {
       'message.created': this.onMessageCreated,
+      'message.updated': this.onMessageUpdated,
       'conversation.typing_on': this.onTypingOn,
+      'conversation.typing_off': this.onTypingOff,
       'conversation.status_changed': this.onStatusChange,
       'presence.update': this.onPresenceUpdate,
-      // ... 访客相关事件
+      'contact.merged': this.onContactMerge,
     };
   }
+
+  onDisconnected = () => {
+    this.setLastMessageId();
+  };
+
+  onReconnect = () => {
+    this.syncLatestMessages();
+  };
+
+  setLastMessageId = () => {
+    this.app.$store.dispatch('conversation/setLastMessageId');
+  };
+
+  syncLatestMessages = () => {
+    this.app.$store.dispatch('conversation/syncLatestMessages');
+  };
 }
 ```
 
 ---
 
-### 14. 完整消息链路示例
+### 14. 前端重连机制
+
+#### 14.1 基础连接器重连逻辑
+
+**重连流程**：
+```
+WebSocket 连接断开
+    ↓
+disconnected 回调触发
+    ↓
+isDisconnected = true
+    ↓
+initReconnectTimer()
+    ↓
+setTimeout(checkConnection, 1000ms)
+    ↓
+checkConnection()
+    ├── isConnectionActive?
+    │   ├── YES → 调用 onReconnect() → 结束
+    │   └── NO  → initReconnectTimer() → 循环
+    ↓
+ActionCable 内部自动重连 (由 @rails/actioncable 库处理)
+```
+
+#### 14.2 客服面板 vs 访客 Widget 重连策略
+
+| 角色 | 断开时处理 | 重连后处理 | 消息丢失风险 |
+|-----|-----------|-----------|-------------|
+| 客服面板 | 发送 `WEBSOCKET_DISCONNECT` 事件 | 发送 `WEBSOCKET_RECONNECT` 事件 | 可能需要手动刷新 |
+| 访客 Widget | 保存最后消息 ID (`setLastMessageId`) | HTTP API 补全 (`syncLatestMessages`) | **不会丢失** |
+
+**客服面板重连影响**：
+- 发送 `WEBSOCKET_RECONNECT` 事件通知全局
+- 在线状态会通过 `triggerPresenceInterval` 自动恢复
+- 但断开期间的消息可能丢失，需要页面刷新或其他机制补全
+
+**访客 Widget 重连策略**：
+1. **断开时**：保存当前最后一条消息 ID
+2. **重连后**：调用 API 同步断开期间的消息
+3. **保证消息不丢失**：通过 HTTP API 补全 WebSocket 断开期间的消息
+
+**重连对多坐席同步的潜在问题**：
+```
+客服A发送消息
+    ↓
+客服B的WebSocket短暂断开 (网络抖动)
+    ↓
+Redis Pub/Sub 广播 MESSAGE_CREATED
+    ↓
+客服B的Rails实例收到消息，但找不到WebSocket连接
+    ↓
+消息丢失
+    ↓
+客服B重连成功
+    ↓
+客服B需要重新获取最新数据
+```
+
+---
+
+### 15. 完整消息链路示例
 
 让我们以"客服发送一条消息"为例，追踪完整的消息链路：
 
@@ -1312,12 +1222,16 @@ class ActionCableConnector extends BaseActionCableConnector {
 
 #### 步骤 2：消息创建触发事件
 
-`app/models/message.rb:378-380`
+`app/models/message.rb:137`
 ```ruby
 after_create_commit :execute_after_create_commit_callbacks
+```
 
+事务提交后，`dispatch_create_events` 被调用：
+
+```ruby
 def dispatch_create_events
-  Rails.configuration.dispatcher.dispatch(MESSAGE_CREATED, Time.zone.now, message: self)
+  Rails.configuration.dispatcher.dispatch(MESSAGE_CREATED, Time.zone.now, message: self, performed_by: Current.executed_by)
 end
 ```
 
@@ -1333,7 +1247,7 @@ end
 
 #### 步骤 4：SyncDispatcher 发布事件
 
-`app/dispatchers/sync_dispatcher.rb:205-207`
+`app/dispatchers/sync_dispatcher.rb:2-5`
 ```ruby
 def dispatch(event_name, timestamp, data)
   event_object = Events::Base.new(event_name, timestamp, data)
@@ -1348,9 +1262,6 @@ end
 def message_created(event)
   message, account = extract_message_and_account(event)
   conversation = message.conversation
-  # 计算需要接收消息的用户 tokens
-  # - 客服 B, C (同一 inbox 的其他成员)
-  # - 访客 (如果不是私有消息)
   tokens = user_tokens(account, conversation.inbox.members) + contact_tokens(conversation.contact_inbox, message)
   
   broadcast(account, tokens, MESSAGE_CREATED, message.push_event_data)
@@ -1414,7 +1325,7 @@ onMessageCreated = data => {
 
 ---
 
-### 15. 关键文件索引
+### 16. 关键文件索引
 
 | 文件路径 | 功能描述 |
 |---------|---------|
@@ -1439,14 +1350,20 @@ onMessageCreated = data => {
 
 ---
 
-### 16. 设计亮点与最佳实践
+### 17. 设计亮点与最佳实践
 
-#### 16.1 同步 vs 异步分离
+#### 17.1 after_commit 确保数据一致性
 
-- **实时广播**（ActionCableListener）使用同步分发，确保低延迟
+- 使用 `after_create_commit` 而非 `after_create`
+- 确保事件触发时数据已持久化到数据库
+- 避免监听器看到未提交的数据
+
+#### 17.2 同步 vs 异步分离
+
+- **实时广播**（ActionCableListener）使用同步分发
 - **耗时操作**（Webhook、自动化规则）使用异步分发，不阻塞请求
 
-#### 16.2 防止事件乱序
+#### 17.3 防止事件乱序
 
 `ActionCableBroadcastJob` 中对会话更新类事件重新获取最新数据：
 ```ruby
@@ -1459,31 +1376,25 @@ def prepare_broadcast_data(event_name, data)
 end
 ```
 
-#### 16.3 Stream 粒度控制
+#### 17.4 Stream 粒度控制
 
 - 个人 Stream：`pubsub_token`（精准推送）
 - 账户 Stream：`account_{id}`（广播给所有客服）
 - 访客只能订阅个人 Stream（安全隔离）
 
-#### 16.4 Redis Pub/Sub 实现水平扩展
+#### 17.5 Redis Pub/Sub 实现水平扩展
 
 - 所有 Rails 实例共享同一个 Redis
 - 任何实例触发的广播都会通过 Redis 到达所有实例
 - 每个实例只负责向自己的 WebSocket 连接推送
 
-#### 16.5 Token 安全策略
-
-- 客服使用 `User.pubsub_token`
-- 访客使用 `ContactInbox.pubsub_token`
-- HMAC 验证的访客有额外的安全机制
-
-#### 16.6 企业版无侵入扩展
+#### 17.6 企业版无侵入扩展
 
 - 使用 `prepend_mod_with` + Ruby `prepend` 实现
 - OSS 代码无需修改
 - 方法可叠加，支持新增和覆盖
 
-#### 16.7 访客消息不丢失保障
+#### 17.7 访客消息不丢失保障
 
 - Widget 断开时记录最后消息 ID
 - 重连后通过 HTTP API 同步缺失消息
@@ -1491,7 +1402,7 @@ end
 
 ---
 
-### 17. 总结
+### 18. 总结
 
 Chatwoot 的实时消息广播系统是一个精心设计的多层架构：
 
@@ -1500,7 +1411,7 @@ Chatwoot 的实时消息广播系统是一个精心设计的多层架构：
 1. **事件驱动**：通过 `after_create_commit` 等回调触发事件（确保数据已持久化）
 2. **事件名映射**：`'message.created'` → `message_created` 方法名转换
 3. **监听器加载**：`config.to_prepare` 时订阅 Wisper listener
-4. **发布-订阅**：使用 Wisper 实现灵活的事件监听
+4. **发布-订阅**：使用 Wisper 实现灵活的事件监听（通过继承 `BaseDispatcher` 获得能力）
 5. **分层分发**：同步（ActionCable/AgentBot）+ 异步（Webhook/自动化）两种策略
 6. **企业扩展**：`prepend_mod_with` 注入企业版模块
 7. **ActionCable**：Rails 原生 WebSocket 框架
