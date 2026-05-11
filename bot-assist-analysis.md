@@ -681,7 +681,7 @@ Content-Type: application/json
 Accept: application/json
 X-Chatwoot-Delivery: 550e8400-e29b-41d4-a716-446655440000
 X-Chatwoot-Timestamp: 1715421600
-X-Chatwoot-Signature: sha256=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+X-Chatwoot-Signature: sha256=8af71344b848b89fda887724d71e781f69b6d5a8a5295370ec4dbe99ce117c7a
 ```
 
 ---
