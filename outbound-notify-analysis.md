@@ -1,544 +1,672 @@
 # Chatwoot 出站通知与 Webhook 投递机制分析
 
-## 1. 架构概览
+## 1. 核心发现：失败处理的三重分类
 
-Chatwoot 采用**异步作业队列 + 事件监听**的架构模式处理出站通知，主要包括：
-- **Slack 集成通知**：通过 `SendOnSlackJob` 处理
-- **外部 Webhook 通知**：通过 `WebhookJob` 和 `AgentBots::WebhookJob` 处理
-- **多渠道消息投递**：通过 `SendReplyJob` 路由到各渠道服务
+Chatwoot 的出站通知失败处理存在**三种截然不同的模式**，这是理解整个系统的关键：
 
-### 核心组件关系图
+| 分类 | 定义 | 触发条件 | 最大次数 | 终态行为 |
+|------|------|----------|----------|----------|
+| **A. 业务层显式重试** | 通过 `retry_on` 明确定义的重试策略 | 特定异常类型 + 业务判断 | 代码定义的 attempts | 执行 exhaustion block 或重新抛出 |
+| **B. 队列默认重试** | Sidekiq/ActiveJob 的默认重试机制 | 任何未被捕获的异常 | Sidekiq 默认 25 次 | 进入 Dead Set（死信队列） |
+| **C. 吞错不重试** | 异常被 `rescue` 捕获且未重新抛出 | 代码中的 `rescue => e` 无 `raise` | 0 次 | 记录日志/更新状态，静默失败 |
+
+---
+
+## 2. 各通道失败处理分类详解
+
+### 2.1 分类总览矩阵
+
+| 通知类型 | 业务层显式重试 | 队列默认重试 | 吞错不重试 | 终态 |
+|----------|----------------|--------------|------------|------|
+| **普通 Webhook** (account/api) | ❌ 无 | ❌ 无 | ✅ 是 | 记录日志，消息事件更新为 failed |
+| **Agent Bot Webhook** | ✅ 部分 | ❌ 无 | ⚠️ 部分 | 重试耗尽后对话转 open（可配置） |
+| **Slack 发送** | ⚠️ 仅锁竞争 | ❌ 无 | ✅ 是 | 致命错误禁用集成，其他静默失败 |
+| **多渠道消息** (SendReplyJob) | ❌ 无 | ⚠️ 部分 | ✅ 多数是 | 更新消息 status = failed |
+
+---
+
+### 2.2 分类 A：业务层显式重试（代码定义）
+
+#### 定义
+通过 `retry_on` 宏明确定义的重试策略，重试逻辑由开发者控制。
+
+#### 完整清单
+
+| 作业类 | 重试异常 | 等待策略 | 最大次数 | 触发条件 | 终态处理 | 文件位置 |
+|--------|----------|----------|----------|----------|----------|----------|
+| `AgentBots::WebhookJob` | `Webhooks::Trigger::RetryableError` | 固定 3s | 3 | HTTP 429/500（仅 Agent Bot） | 执行 `handle_failure` | `app/jobs/agent_bots/webhook_job.rb:3-8` |
+| `SendOnSlackJob` | `LockAcquisitionError` | 固定 1s | 8 | Redis 锁获取失败 | 重新抛出（无 exhaustion block） | `app/jobs/send_on_slack_job.rb:3` |
+| `UpdateSlackMessageJob` | `LockAcquisitionError` | 固定 1s | 8 | Redis 锁获取失败 | 重新抛出 | `app/jobs/update_slack_message_job.rb:3` |
+| `HookJob` | `LockAcquisitionError` | 固定 3s | 3 | Redis 锁获取失败 | 重新抛出 | `app/jobs/hook_job.rb:2` |
+| `Webhooks::WhatsappEventsJob` | `LockAcquisitionError` | 固定 2s | 20 | Redis 锁获取失败 | 重新抛出 | `app/jobs/webhooks/whatsapp_events_job.rb:6` |
+| `Webhooks::FacebookEventsJob` | `LockAcquisitionError` | 固定 1s | 8 | Redis 锁获取失败 | 重新抛出 | `app/jobs/webhooks/facebook_events_job.rb:3` |
+| `Webhooks::InstagramEventsJob` | `LockAcquisitionError` | 固定 1s | 8 | Redis 锁获取失败 | 重新抛出 | `app/jobs/webhooks/instagram_events_job.rb:3` |
+| `Webhooks::TiktokEventsJob` | `LockAcquisitionError` | 固定 2s | 8 | Redis 锁获取失败 | 重新抛出 | `app/jobs/webhooks/tiktok_events_job.rb:4` |
+
+#### Agent Bot 重试的关键限制
+```ruby
+# lib/webhooks/trigger.rb:3
+RETRYABLE_AGENT_BOT_STATUSES = [429, 500].freeze
+
+# lib/webhooks/trigger.rb:125-127
+def retryable_agent_bot_error?(error)
+  @webhook_type == :agent_bot_webhook && RETRYABLE_AGENT_BOT_STATUSES.include?(http_status(error))
+end
+
+# lib/webhooks/trigger.rb:129-133
+def http_status(error)
+  return unless error.is_a?(SafeFetch::HttpError)  # ← 关键！只有 HttpError 才提取状态码
+  error.message.to_s[/\A(\d{3})\b/, 1]&.to_i
+end
+```
+
+**触发条件详解**：
+1. ✅ **HTTP 429** (Too Many Requests) → 触发重试
+2. ✅ **HTTP 500** (Internal Server Error) → 触发重试
+3. ❌ **HTTP 502** (Bad Gateway) → **不触发**
+4. ❌ **HTTP 503** (Service Unavailable) → **不触发**
+5. ❌ **HTTP 504** (Gateway Timeout) → **不触发**
+6. ❌ **网络超时** (`Net::OpenTimeout`, `Net::ReadTimeout`) → **不触发**（因为是 `SafeFetch::FetchError`，不是 `HttpError`）
+7. ❌ **连接错误** (`SocketError`) → **不触发**
+8. ❌ **SSL 错误** (`OpenSSL::SSL::SSLError`) → **不触发**
+
+---
+
+### 2.3 分类 B：队列默认重试（Sidekiq 默认）
+
+#### 定义
+异常未被任何 `rescue` 捕获，向上抛出到 Sidekiq，触发 Sidekiq 的默认重试机制。
+
+#### Sidekiq 默认行为
+- **最大重试次数**：25 次
+- **退避策略**：指数退避 `(count^4) + 15` 秒
+  - 第 1 次：16 秒
+  - 第 2 次：31 秒
+  - 第 3 次：96 秒
+  - ...
+  - 第 25 次：约 15 天
+- **终态**：25 次后进入 `Sidekiq::DeadSet`（死信队列，保留 6 个月）
+
+#### 可能触发队列默认重试的场景
+
+在 Chatwoot 当前代码中，**几乎没有通道会触发队列默认重试**，因为：
+
+1. **WebhookJob**：`Webhooks::Trigger.execute` 捕获所有 `StandardError`，不重新抛出
+2. **HookJob**：`perform` 方法末尾有 `rescue StandardError => e; Rails.logger.error e; end`
+3. **SendReplyJob**：各 `SendOn*Service` 自己有 `rescue`
+
+**唯一可能的例外**：
+- 某些 `SendOn*Service` 的 `rescue` 可能不完整，导致特定异常漏网
+
+#### 代码证据
+```ruby
+# app/jobs/hook_job.rb:19-21
+rescue StandardError => e
+  Rails.logger.error e
+  # ← 没有重新抛出！异常被吞掉
+end
+```
+
+```ruby
+# lib/webhooks/trigger.rb:26-32
+def execute
+  perform_request
+rescue StandardError => e
+  raise RetryableError.new(...) if retryable_agent_bot_error?(e)
+  handle_failure(e)  # ← 其他情况不重新抛出！
+end
+```
+
+---
+
+### 2.4 分类 C：吞错不重试（静默失败）
+
+#### 定义
+异常被 `rescue` 捕获，记录日志或更新状态，但**不重新抛出异常**，作业被标记为成功。
+
+#### 完整清单
+
+| 通知类型 | 捕获位置 | 捕获的异常 | 终态处理 | 文件位置 |
+|----------|----------|------------|----------|----------|
+| **普通 Webhook** (account) | `Webhooks::Trigger#execute` | 所有 `StandardError` | 记录 warn 日志 | `lib/webhooks/trigger.rb:28-32` |
+| **普通 Webhook** (api_inbox) | `Webhooks::Trigger#execute` | 所有 `StandardError` | 记录日志 + 消息 status=failed | `lib/webhooks/trigger.rb:72-74` |
+| **Slack 发送** (致命错误) | `SendOnSlackService#send_message` | 特定 Slack API 错误 | 禁用集成 + 记录 error 日志 | `lib/integrations/slack/send_on_slack_service.rb:105-111` |
+| **Slack 附件上传** | `SendOnSlackService#upload_files` | `Slack::Web::Api::Errors::SlackError` | 记录 error 日志 | `lib/integrations/slack/send_on_slack_service.rb:136-138` |
+| **HookJob (所有集成)** | `HookJob#perform` | 所有 `StandardError` | 记录 error 日志 | `app/jobs/hook_job.rb:19-21` |
+| **Twilio 消息发送** | `Twilio::SendOnTwilioService#perform_reply` | `Twilio::REST::TwilioError/RestError` | 消息 status=failed | `app/services/twilio/send_on_twilio_service.rb:35-37` |
+| **Tiktok 消息发送** | `Tiktok::SendOnTiktokService#perform` | 所有 `StandardError` | 消息 status=failed | `app/services/tiktok/send_on_tiktok_service.rb:17-19` |
+| **Facebook 消息发送** | `Facebook::SendOnFacebookService` | 多种异常 | 消息 status=failed | `app/services/facebook/send_on_facebook_service.rb` |
+| **Email 发送** | `Email::SendOnEmailService#perform_reply` | 所有 `StandardError` | 消息 status=failed + Sentry | `app/services/email/send_on_email_service.rb:14-17` |
+
+#### 吞错代码示例
+```ruby
+# app/jobs/hook_job.rb:19-21
+# 这个 rescue 会吞掉所有异常，包括 Slack 发送失败！
+rescue StandardError => e
+  Rails.logger.error e
+  # 没有 raise，异常被吞掉
+end
+```
+
+```ruby
+# lib/webhooks/trigger.rb:28-32
+# 普通 Webhook 的所有异常都在这里被吞掉
+rescue StandardError => e
+  raise RetryableError.new(...) if retryable_agent_bot_error?(e)  # 仅 Agent Bot 的 429/500
+  handle_failure(e)  # 其他情况：记录日志，不重新抛出
+end
+```
+
+---
+
+## 3. 三个关键通道的深度对比
+
+### 3.1 普通 Webhook vs Agent Bot vs Slack：网络超时与 5xx 差异
+
+#### 对比矩阵
+
+| 错误类型 | 普通 Webhook | Agent Bot Webhook | Slack 发送 |
+|----------|-------------|-------------------|------------|
+| **网络超时** (OpenTimeout) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **读取超时** (ReadTimeout) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **连接错误** (SocketError) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **SSL 错误** | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **HTTP 408** (Timeout) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **HTTP 429** (限流) | 吞错不重试 ❌ | 业务层重试 ✅ (3次) | 吞错不重试 ❌ |
+| **HTTP 500** (服务器错误) | 吞错不重试 ❌ | 业务层重试 ✅ (3次) | 吞错不重试 ❌ |
+| **HTTP 502** (Bad Gateway) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **HTTP 503** (Service Unavailable) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+| **HTTP 504** (Gateway Timeout) | 吞错不重试 ❌ | 吞错不重试 ❌ | 吞错不重试 ❌ |
+
+#### 原因分析
+
+**普通 Webhook**：
+```ruby
+# lib/webhooks/trigger.rb:28-32
+rescue StandardError => e
+  raise RetryableError.new(...) if retryable_agent_bot_error?(e)
+  # retryable_agent_bot_error? 检查 @webhook_type == :agent_bot_webhook
+  # 普通 Webhook 永远不满足这个条件！
+  handle_failure(e)  # → 直接吞错
+end
+```
+
+**Agent Bot Webhook**：
+```ruby
+# lib/webhooks/trigger.rb:125-127
+def retryable_agent_bot_error?(error)
+  @webhook_type == :agent_bot_webhook && 
+    RETRYABLE_AGENT_BOT_STATUSES.include?(http_status(error))
+    # RETRYABLE_AGENT_BOT_STATUSES = [429, 500].freeze
+    # 注意：502/503/504 不在列表中！
+end
+
+# lib/webhooks/trigger.rb:129-133
+def http_status(error)
+  return unless error.is_a?(SafeFetch::HttpError)
+  # 网络超时是 SafeFetch::FetchError，不是 HttpError！
+  # 所以网络超时永远不会触发重试！
+  error.message.to_s[/\A(\d{3})\b/, 1]&.to_i
+end
+```
+
+**Slack 发送**：
+```ruby
+# app/jobs/hook_job.rb:19-21
+# HookJob 捕获所有异常，所以 Slack 发送的任何异常都会被吞掉
+rescue StandardError => e
+  Rails.logger.error e
+end
+
+# lib/integrations/slack/send_on_slack_service.rb:105-111
+# SendOnSlackService 只捕获特定的致命错误
+rescue Slack::Web::Api::Errors::IsArchived, ... => e
+  hook.disable
+  # 其他 Slack 错误（如 429、5xx）会向上抛出
+  # 但最终会被 HookJob 的 rescue 捕获
+end
+```
+
+#### 结论：当前系统的"伪重试"问题
+
+| 表象 | 实际 |
+|------|------|
+| Agent Bot 有重试 | 仅对 HTTP 429/500，网络超时和其他 5xx 都不重试 |
+| 普通 Webhook 应该重试 | 实际上完全不重试，静默失败 |
+| Slack 发送应该重试 | HookJob 的 rescue 吞掉所有异常，完全不重试 |
+| 队列默认重试兜底 | 由于到处都是 rescue，几乎不会触发 |
+
+**结果**：当前系统中，网络抖动、网关超时等临时性错误导致的通知失败，**几乎没有任何重试机制**！
+
+---
+
+## 4. 避免双重重试风暴的治理方案
+
+### 4.1 问题根源：双重重试风险
+
+#### 什么是双重重试？
 
 ```
-消息创建/更新
+异常发生
     ↓
-事件分发 (ActiveRecord callbacks + Wisper)
+┌─────────────────────────────────────────────────────────┐
+│  业务层重试（retry_on）                                   │
+│  - 等待 3s，重试 3 次                                     │
+│  - 第 3 次失败 → exhaustion block                         │
+│  - 如果 exhaustion block 没有吸收异常 → 异常继续向上抛出    │
+└─────────────────────────────────────────────────────────┘
     ↓
+┌─────────────────────────────────────────────────────────┐
+│  Sidekiq 默认重试                                         │
+│  - 等待 16s, 31s, 96s...                                  │
+│  - 重试 25 次（约 15 天）                                  │
+│  - 最终进入 Dead Set                                      │
+└─────────────────────────────────────────────────────────┘
+
+问题：业务层重试了 3 次，Sidekiq 又重试了 25 次
+     总共 28 次重试！接收方可能被打爆！
+```
+
+#### Chatwoot 中的实际风险
+
+**当前代码中的安全处理**（好的例子）：
+```ruby
+# enterprise/app/jobs/captain/documents/perform_sync_job.rb:11-13
+# 注释明确说明：吸收最终异常，避免 Sidekiq 叠加重试
+retry_on StandardError, wait: 5.seconds, attempts: 3 do |job, error|
+  # exhaustion block 吸收异常
+  ChatwootExceptionTracker.new(error, account: document.account).capture_exception
+  job.send(:log_sync_outcome, document, result: :unexpected_retry_exhausted, ...)
+  # ← 没有重新抛出异常！
+end
+```
+
+**当前代码中的风险处理**（Agent Bot Webhook）：
+```ruby
+# app/jobs/agent_bots/webhook_job.rb:3-8
+retry_on Webhooks::Trigger::RetryableError, wait: 3.seconds, attempts: 3 do |job, error|
+  # exhaustion block 调用 handle_failure
+  Webhooks::Trigger.new(...).handle_failure(error)
+  # handle_failure 内部没有 raise
+  # 所以异常被吸收了 ✓
+end
+```
+
+---
+
+### 4.2 治理方案：三层重试协作模型
+
+#### 方案原则
+
+```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                           事件监听器层                                    │
-├────────────────────────────┬────────────────────────────┬────────────────┤
-│ WebhookListener            │ AgentBotListener           │ HookListener   │
-│ (外部 Webhook: 账户/API)    │ (Agent Bot 回调)            │ (集成 Hooks)   │
-└────────────────────────────┴────────────────────────────┴────────────────┘
-    ↓                                    ↓                          ↓
-WebhookJob                    AgentBots::WebhookJob            HookJob
-(medium queue)                (high queue)                    (medium queue)
-    ↓                                    ↓                          ↓
-Webhooks::Trigger.execute    Webhooks::Trigger.execute    ┌───────────────┐
-(HTTP POST)                   (HTTP POST, 带重试)           │ SendOnSlackJob│
-                                                           │ (medium queue)│
-                                                           │ + 分布式锁    │
-                                                           └───────────────┘
-                                                                  ↓
-                                                     Integrations::Slack::SendOnSlackService
+│                        重试分层治理原则                                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Layer 1: 业务层重试（retry_on）                                          │
+│  ├── ✅ 保留：针对已知可重试异常（网络错误、429、5xx）                       │
+│  ├── ✅ 明确指定：异常类型、等待策略、最大次数                               │
+│  └── ✅ 必须有 exhaustion block 吸收异常（避免 Layer 2 介入）               │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Layer 2: 队列默认重试（Sidekiq）                                         │
+│  ├── 🚫 关闭：对于有业务层重试的作业                                        │
+│  ├── ⚠️ 保留：仅作为完全意外的兜底                                          │
+│  └── ⚠️ 配置：减少默认重试次数（如 3 次而非 25 次）                          │
+├─────────────────────────────────────────────────────────────────────────┤
+│  Layer 3: 吞错不重试（rescue 无 raise）                                    │
+│  ├── 🚫 避免：不应该用 rescue 吞掉所有异常                                   │
+│  ├── ✅ 替代：区分可重试/不可重试，可重试的抛出，不可重试的记录状态             │
+│  └── ✅ 例外：已知的致命错误（认证失败、配置错误）                            │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
----
+#### 具体方案：按作业类型配置
 
-## 2. 外部回调分层详解
-
-### 2.1 回调类型分层总览
-
-Chatwoot 存在三种独立的外部回调机制，各自有不同的触发源、数据模型和失败处理边界：
-
-| 回调类型 | 数据模型 | 监听器 | 作业类 | 队列 | 核心用途 |
-|----------|----------|--------|--------|------|----------|
-| **账户级 Webhook** | `Webhook` (webhook_type: account_type) | `WebhookListener` | `WebhookJob` | medium | 账户级别事件广播（CRM/数据分析） |
-| **API 渠道回调** | `Channel::Api` (webhook_url 字段) | `WebhookListener` | `WebhookJob` | medium | API 渠道的消息事件通知 |
-| **Agent Bot 回调** | `AgentBot` (outgoing_url 字段) | `AgentBotListener` | `AgentBots::WebhookJob` | high | 智能体机器人交互（对话自动化） |
+| 作业类型 | Layer 1 业务层重试 | Layer 2 队列默认重试 | Layer 3 吞错 | 幂等键 | 告警 |
+|----------|-------------------|---------------------|-------------|--------|------|
+| **AgentBot WebhookJob** | ✅ 保留并增强 | 🚫 关闭（sidekiq_options retry: 0） | 🚫 移除 | `X-Chatwoot-Delivery` | 重试耗尽 → P2 |
+| **普通 WebhookJob** | ✅ 新增 | 🚫 关闭 | 🚫 移除 | `X-Chatwoot-Delivery` | 失败率 > 10% → P2 |
+| **SendOnSlackJob** | ✅ 新增 | 🚫 关闭 | 🚫 从 HookJob 移除 | `slack:{conversation_id}:{reference_id}` | 连续失败 → P1 |
+| **SendReplyJob** | ✅ 新增（各渠道） | 🚫 关闭 | 🚫 仅致命错误 | `channel:{type}:{message_id}` | 成功率 < 95% → P1 |
+| **HookJob** | ⚠️ 仅保留锁竞争 | 🚫 关闭 | 🚫 移除 rescue | - | 子作业失败透传 |
 
 ---
 
-### 2.2 分层一：账户级 Webhook (Account/Inbox Webhook)
+### 4.3 方案一：Agent Bot WebhookJob 增强
 
-#### 数据模型
-- **表**：`webhooks`
-- **关键字段**：
-  - `webhook_type`：`account_type`(0) 或 `inbox_type`(1)
-  - `url`：回调 URL
-  - `secret`：签名密钥（自动生成，支持加密存储）
-  - `subscriptions`：订阅的事件类型数组（JSONB）
-  - `account_id` / `inbox_id`：作用域
+#### 当前问题
+- 仅重试 HTTP 429/500
+- 网络超时、502/503/504 都不重试
+- 但这些才是最常见的临时性错误！
 
-- 文件位置：`app/models/webhook.rb:21-44`
+#### 改进方案
 
-#### 触发机制
-- **监听器**：`WebhookListener`（`app/listeners/webhook_listener.rb`）
-- **事件订阅**：
-  ```ruby
-  ALLOWED_WEBHOOK_EVENTS = %w[
-    conversation_status_changed conversation_updated conversation_created
-    contact_created contact_updated message_created message_updated
-    webwidget_triggered inbox_created inbox_updated
-    conversation_typing_on conversation_typing_off
+```ruby
+# 建议修改 app/jobs/agent_bots/webhook_job.rb
+
+class AgentBots::WebhookJob < WebhookJob
+  queue_as :high
+  
+  # 关闭 Sidekiq 默认重试，避免双重重试
+  sidekiq_options retry: 0
+  
+  # 可重试的 HTTP 状态码
+  RETRYABLE_HTTP_STATUSES = [408, 429, 500, 502, 503, 504].freeze
+  
+  # 网络错误类型
+  NETWORK_ERRORS = [
+    Net::OpenTimeout,
+    Net::ReadTimeout,
+    SocketError,
+    OpenSSL::SSL::SSLError,
+    SafeFetch::FetchError
   ].freeze
-  ```
-  - 文件位置：`app/models/webhook.rb:32-34`
+  
+  # HTTP 429：限流，指数退避 + 抖动，最多 8 次
+  retry_on Webhooks::Trigger::RateLimitError, 
+           wait: ->(executions) { [2.seconds * (2**executions) * rand(0.5..1.5), 60.seconds].min },
+           attempts: 8 do |job, error|
+    # 限流：记录 metric，继续后续处理
+    Metrics.increment('outbound_webhook_rate_limited', tags: { bot_id: job.bot_id })
+    Webhooks::Trigger.new(...).handle_failure(error)
+  end
+  
+  # 网络错误和其他 5xx：指数退避，最多 5 次
+  retry_on Webhooks::Trigger::TransientError,
+           wait: ->(executions) { [1.second * (2**executions), 30.seconds].min },
+           attempts: 5 do |job, error|
+    # 重试耗尽：记录告警
+    Metrics.increment('outbound_webhook_retry_exhausted', tags: { bot_id: job.bot_id })
+    Alerting.trigger(:webhook_retry_exhausted, job_id: job.job_id, error: error.message)
+    Webhooks::Trigger.new(...).handle_failure(error)
+  end
+  
+  # 不可重试的错误：直接丢弃
+  discard_on Webhooks::Trigger::PermanentError do |job, error|
+    Metrics.increment('outbound_webhook_permanent_failure', tags: { bot_id: job.bot_id })
+    Rails.logger.error "Agent Bot permanent failure: #{error.message}"
+  end
+  
+  def perform(url, payload, webhook_type = :agent_bot_webhook, secret: nil, delivery_id: nil)
+    super(url, payload, webhook_type, secret: secret, delivery_id: delivery_id)
+  rescue Webhooks::Trigger::RetryableError => e
+    Rails.logger.warn("[AgentBots::WebhookJob] attempt #{executions} failed")
+    raise  # 重新抛出让 retry_on 处理
+  end
+end
+```
 
-- **入队逻辑**：
-  ```ruby
-  def deliver_account_webhooks(payload, account)
-    account.webhooks.account_type.each do |webhook|
-      next unless webhook.subscriptions.include?(payload[:event])
-      WebhookJob.perform_later(webhook.url, payload, :account_webhook,
-                               secret: webhook.secret,
-                               delivery_id: SecureRandom.uuid)
+```ruby
+# 建议修改 lib/webhooks/trigger.rb
+
+class Webhooks::Trigger
+  # 新增异常分类
+  class RateLimitError < StandardError; end      # 429
+  class TransientError < StandardError; end      # 网络错误、5xx
+  class PermanentError < StandardError; end      # 401、403、404
+  
+  def execute
+    perform_request
+  rescue StandardError => e
+    error_type = classify_error(e)
+    
+    case error_type
+    when :rate_limit
+      raise RateLimitError, e.message
+    when :transient
+      raise TransientError, e.message
+    when :permanent
+      raise PermanentError, e.message
     end
   end
-  ```
-  - 文件位置：`app/listeners/webhook_listener.rb:110-118`
-
-#### 失败处理边界
-| 处理维度 | 行为 | 边界说明 |
-|----------|------|----------|
-| **自动重试** | ❌ 无 | 完全不重试，无论任何错误 |
-| **状态更新** | ❌ 无 | 不更新任何业务数据状态 |
-| **消息状态** | ❌ 不影响 | Webhook 失败不影响消息本身的发送状态 |
-| **对话流转** | ❌ 不影响 | 不会触发对话状态变更 |
-| **日志记录** | ✅ 有 | `Rails.logger.warn "Exception: Invalid webhook URL #{url} : #{error.message}"` |
-| **异常上报** | ❌ 无 | 不调用 Sentry/异常追踪 |
-| **死信队列** | ❌ 无 | Sidekiq 默认重试可能介入，但非主动设计 |
-
-**边界结论**：账户级 Webhook 是"尽力而为"的通知机制，失败即丢弃，业务系统需要自行保证数据一致性或实现补偿逻辑。
-
----
-
-### 2.3 分层二：API 渠道回调 (API Inbox Webhook)
-
-#### 数据模型
-- **表**：`channel_api`
-- **关键字段**：
-  - `webhook_url`：回调 URL
-  - `secret`：签名密钥
-  - `hmac_token`：HMAC 验证令牌（用于入站消息验证）
-  - `hmac_mandatory`：是否强制 HMAC 验证
-  - `identifier`：渠道唯一标识
-
-- 文件位置：`app/models/channel/api.rb:22-46`
-
-#### 触发机制
-- **监听器**：`WebhookListener`（同一监听器，不同分支）
-- **入队条件**：
-  ```ruby
-  def deliver_api_inbox_webhooks(payload, inbox)
-    return unless inbox.channel_type == 'Channel::Api'
-    return if inbox.channel.webhook_url.blank?
-
-    WebhookJob.perform_later(inbox.channel.webhook_url, payload, :api_inbox_webhook,
-                             secret: inbox.channel.secret, delivery_id: SecureRandom.uuid)
-  end
-  ```
-  - 文件位置：`app/listeners/webhook_listener.rb:120-126`
-
-- **触发事件**：与账户级 Webhook 相同的 12 种事件
-
-#### 失败处理边界
-| 处理维度 | 行为 | 边界说明 |
-|----------|------|----------|
-| **自动重试** | ❌ 无 | 与账户级相同，无重试机制 |
-| **状态更新** | ⚠️ 部分 | 仅对 `message_created` / `message_updated` 事件更新消息状态 |
-| **消息状态** | ⚠️ 条件更新 | 调用 `Messages::StatusUpdateService.new(message, 'failed', error.message).perform` |
-| **对话流转** | ❌ 不影响 | 不会触发对话状态变更 |
-| **日志记录** | ✅ 有 | 同账户级 Webhook |
-| **异常上报** | ❌ 无 | 不调用 Sentry |
-
-**关键代码**：
-```ruby
-def handle_error(error)
-  return unless SUPPORTED_ERROR_HANDLE_EVENTS.include?(@payload[:event])
-  return unless message
-
-  case @webhook_type
-  when :agent_bot_webhook
-    update_conversation_status(message)
-  when :api_inbox_webhook
-    update_message_status(error)  # ← API 渠道特有
+  
+  private
+  
+  def classify_error(error)
+    # Agent Bot 的限流：业务层重试
+    if @webhook_type == :agent_bot_webhook
+      status = http_status(error)
+      
+      if status == 429
+        :rate_limit
+      elsif [408, 500, 502, 503, 504].include?(status)
+        :transient
+      elsif NETWORK_ERRORS.any? { |e| error.is_a?(e) }
+        :transient
+      elsif [401, 403, 404].include?(status)
+        :permanent
+      else
+        # 其他错误：记录日志，不重试
+        handle_failure(error)
+        nil
+      end
+    else
+      # 普通 Webhook：当前方案是吞错不重试
+      # 改进方案：也应该有重试逻辑
+      handle_failure(error)
+      nil
+    end
   end
 end
 ```
-- 文件位置：`lib/webhooks/trigger.rb:65-75`
-
-**边界结论**：API 渠道回调在消息事件失败时会标记消息为 `failed`，但其他事件（如对话创建、联系人更新）失败时无任何状态追溯。消息状态更新仅作为"已尝试"标记，不触发重试。
 
 ---
 
-### 2.4 分层三：Agent Bot 回调 (Agent Bot Webhook)
+### 4.4 方案二：普通 WebhookJob 新增重试
 
-#### 数据模型
-- **表**：`agent_bots`
-- **关键字段**：
-  - `outgoing_url`：回调 URL（注意：字段名不是 webhook_url）
-  - `secret`：签名密钥
-  - `bot_type`：仅支持 `webhook`(0)
-  - `bot_config`：机器人配置（JSONB）
-  - `account_id`：可空，空表示系统级机器人
+#### 当前问题
+- 完全不重试，网络抖动导致的通知直接丢失
+- 业务系统需要自行补偿
 
-- 文件位置：`app/models/agent_bot.rb:21-69`
+#### 改进方案
 
-#### 触发机制
-- **监听器**：`AgentBotListener`（`app/listeners/agent_bot_listener.rb`）
-- **触发条件**：
-  - Inbox 关联的激活机器人：`inbox.agent_bot_inbox&.active?`
-  - 对话指定的机器人：`conversation.assignee_agent_bot`
-- **入队逻辑**：
-  ```ruby
-  def process_webhook_bot_event(agent_bot, payload)
-    return if agent_bot.outgoing_url.blank?
+```ruby
+# 建议修改 app/jobs/webhook_job.rb
 
-    AgentBots::WebhookJob.perform_later(agent_bot.outgoing_url, payload, :agent_bot_webhook,
-                                        secret: agent_bot.secret, delivery_id: SecureRandom.uuid)
+class WebhookJob < ApplicationJob
+  queue_as :medium
+  
+  # 关闭 Sidekiq 默认重试
+  sidekiq_options retry: 0
+  
+  # 指数退避：1s, 2s, 4s, 8s, 16s，最多 5 次
+  retry_on Webhooks::Trigger::TransientError,
+           wait: ->(executions) { [1.second * (2**executions), 30.seconds].min },
+           attempts: 5 do |job, error|
+    url, payload, webhook_type = job.arguments
+    Metrics.increment('outbound_webhook_retry_exhausted', tags: { webhook_type: webhook_type })
+    
+    # 重试耗尽：记录告警
+    if webhook_type == :account_webhook
+      Alerting.trigger(:account_webhook_failure, url: url, error: error.message)
+    end
+    
+    Webhooks::Trigger.new(...).handle_failure(error)
   end
-  ```
-  - 文件位置：`app/listeners/agent_bot_listener.rb:85-90`
-
-#### 失败处理边界（最复杂的分层）
-
-**A. 可重试错误（主动设计）**
-```ruby
-RETRYABLE_AGENT_BOT_STATUSES = [429, 500].freeze
-```
-- 文件位置：`lib/webhooks/trigger.rb:3`
-
-**重试配置**：
-```ruby
-retry_on Webhooks::Trigger::RetryableError, wait: 3.seconds, attempts: 3 do |job, error|
-  url, payload, webhook_type = job.arguments
-  kwargs = job.arguments.last.is_a?(Hash) ? job.arguments.last : {}
-  Webhooks::Trigger.new(url, payload, webhook_type || :agent_bot_webhook,
-                        secret: kwargs[:secret], delivery_id: kwargs[:delivery_id]).handle_failure(error)
+  
+  # 不可重试的错误
+  discard_on Webhooks::Trigger::PermanentError do |job, error|
+    Metrics.increment('outbound_webhook_permanent_failure')
+    Rails.logger.error "Webhook permanent failure: #{error.message}"
+  end
+  
+  def perform(url, payload, webhook_type = :account_webhook, secret: nil, delivery_id: nil)
+    Webhooks::Trigger.execute(url, payload, webhook_type, secret: secret, delivery_id: delivery_id)
+  end
 end
 ```
-- 文件位置：`app/jobs/agent_bots/webhook_job.rb:3-8`
-
-**B. 重试耗尽后的降级处理**
-```ruby
-def update_conversation_status(message)
-  conversation = message.conversation
-  return unless conversation&.pending?
-  return if conversation&.account&.keep_pending_on_bot_failure
-
-  conversation.open!
-  create_agent_bot_error_activity(conversation)
-end
-```
-- 文件位置：`lib/webhooks/trigger.rb:77-84`
-
-**完整边界矩阵**：
-
-| 处理维度 | 行为 | 边界说明 |
-|----------|------|----------|
-| **自动重试** | ✅ 有 | 仅对 HTTP 429（限流）和 500（服务器错误）重试 |
-| **重试策略** | 固定间隔 | 等待 3 秒，最多 3 次 |
-| **状态更新** | ⚠️ 条件 | 重试耗尽后，仅对 pending 状态的对话执行降级 |
-| **对话流转** | ✅ 有条件 | `conversation.open!`（可通过 `keep_pending_on_bot_failure` 禁用） |
-| **活动记录** | ✅ 有 | 创建活动消息：`conversations.activity.agent_bot.error_moved_to_open` |
-| **日志记录** | ✅ 有 | 每次重试失败都记录警告日志 |
-| **异常上报** | ❌ 无 | 不调用 Sentry |
-
-**账户级开关**：
-```ruby
-'keep_pending_on_bot_failure': { 'type': %w[boolean null] }
-```
-- 文件位置：`app/models/concerns/account_settings_schema.rb:13`
-
-**边界结论**：Agent Bot 回调是唯一具有完整重试 + 降级策略的分层。重试仅针对限流和服务器错误（网络错误/超时不在此列），重试耗尽后通过对话状态流转实现业务降级，确保用户不会永远卡在机器人待处理状态。
-
----
-
-### 2.5 三种回调的失败边界对比
-
-| 维度 | 账户级 Webhook | API 渠道回调 | Agent Bot 回调 |
-|------|---------------|-------------|----------------|
-| **重试机制** | 无 | 无 | HTTP 429/500，3次 |
-| **消息状态影响** | 无 | 消息事件失败时标记 failed | 无（影响对话状态） |
-| **对话状态影响** | 无 | 无 | pending → open（可配置） |
-| **活动记录** | 无 | 无 | 机器人错误活动消息 |
-| **业务降级** | 无 | 无 | ✅ 完整降级策略 |
-| **队列优先级** | medium | medium | high |
-| **数据一致性** | 最终一致靠接收方 | 消息状态可追溯 | 对话状态保证不阻塞 |
-
----
-
-## 3. 投递机制详解
-
-### 3.1 Slack 通知投递机制
-
-#### 触发流程
-1. **事件监听**：`HookListener` 监听 `message.created` 和 `message.updated` 事件
-   - 文件位置：`app/listeners/hook_listener.rb:58-71`
-
-2. **作业入队**：`HookJob` 根据 `app_id` 路由到具体集成
-   - 文件位置：`app/jobs/hook_job.rb:9-18`
-   - 带附件的消息延迟 2 秒发送
-
-3. **分布式锁机制**：`SendOnSlackJob` 继承自 `MutexApplicationJob`
-   - 文件位置：`app/jobs/send_on_slack_job.rb:1-10`
-   - 锁键格式：`Redis::Alfred::SLACK_MESSAGE_MUTEX`
-
-4. **核心发送服务**：`Integrations::Slack::SendOnSlackService`
-   - 文件位置：`lib/integrations/slack/send_on_slack_service.rb:1-215`
-
-#### Slack API 错误处理（非重试型致命错误）
-```ruby
-rescue Slack::Web::Api::Errors::IsArchived,
-       Slack::Web::Api::Errors::AccountInactive,
-       Slack::Web::Api::Errors::MissingScope,
-       Slack::Web::Api::Errors::InvalidAuth,
-       Slack::Web::Api::Errors::ChannelNotFound,
-       Slack::Web::Api::Errors::NotInChannel => e
-  Rails.logger.error e
-  hook.prompt_reauthorization!
-  hook.disable
-```
-- 文件位置：`lib/integrations/slack/send_on_slack_service.rb:105-111`
-
----
-
-### 3.2 Webhook 请求规范（通用）
-
-#### 三层回调共享的 HTTP 规范
-- **HTTP 方法**：POST
-- **Content-Type**：application/json
-- **超时设置**：默认 5 秒，可通过 `WEBHOOK_TIMEOUT` 全局配置
-- **HTTP 客户端**：`SafeFetch`（内置 SSRF 防护）
-
-#### 请求头
-```ruby
-headers = {
-  'Content-Type' => 'application/json',
-  'Accept' => 'application/json',
-  'X-Chatwoot-Delivery' => @delivery_id,  # UUID，每次请求唯一
-  'X-Chatwoot-Timestamp' => ts,           # 当前时间戳
-  'X-Chatwoot-Signature' => "sha256=#{HMAC}"  # 仅配置 secret 时
-}
-```
-- 文件位置：`lib/webhooks/trigger.rb:54-63`
-
-#### 签名算法
-```ruby
-headers['X-Chatwoot-Signature'] = "sha256=#{OpenSSL::HMAC.hexdigest('SHA256', secret, "#{ts}.#{body}")}"
-```
-- 文件位置：`lib/webhooks/trigger.rb:58-61`
-
----
-
-### 3.3 多渠道消息投递机制
-
-#### 统一入口：SendReplyJob
-- 文件位置：`app/jobs/send_reply_job.rb:1-39`
-- 队列优先级：`:high`
-
-#### 支持的渠道服务映射
-```ruby
-CHANNEL_SERVICES = {
-  'Channel::TwitterProfile' => ::Twitter::SendOnTwitterService,
-  'Channel::TwilioSms'      => ::Twilio::SendOnTwilioService,
-  'Channel::Line'           => ::Line::SendOnLineService,
-  'Channel::Telegram'       => ::Telegram::SendOnTelegramService,
-  'Channel::Whatsapp'       => ::Whatsapp::SendOnWhatsappService,
-  'Channel::Sms'            => ::Sms::SendOnSmsService,
-  'Channel::Instagram'      => ::Instagram::SendOnInstagramService,
-  'Channel::Tiktok'         => ::Tiktok::SendOnTiktokService,
-  'Channel::Email'          => ::Email::SendOnEmailService,
-  'Channel::WebWidget'      => ::Messages::SendEmailNotificationService,
-  'Channel::Api'            => ::Messages::SendEmailNotificationService
-}.freeze
-```
-- 文件位置：`app/jobs/send_reply_job.rb:4-16`
-
----
-
-## 4. 现有失败重试策略
-
-### 4.1 队列优先级设计
-
-| 优先级 | 队列名 | 使用场景 |
-|--------|--------|----------|
-| **high** | `:high` | `SendReplyJob`（渠道消息投递）、`AgentBots::WebhookJob`（机器人 Webhook）、`ActivityMessageJob` |
-| **medium** | `:medium` | `SendOnSlackJob`、`WebhookJob`、`HookJob`、`UpdateSlackMessageJob` |
-| **low** | `:low` | 投递状态回调、数据同步、后台清理任务 |
-
-### 4.2 现有重试策略汇总
-
-#### A. 分布式锁获取失败重试
-| 作业类 | 等待时间 | 最大重试次数 |
-|--------|----------|--------------|
-| `SendOnSlackJob` | 1 秒 | 8 次 |
-| `UpdateSlackMessageJob` | 1 秒 | 8 次 |
-| `HookJob` | 3 秒 | 3 次 |
-| `FacebookEventsJob` | 1 秒 | 8 次 |
-| `InstagramEventsJob` | 1 秒 | 8 次 |
-| `WhatsappEventsJob` | 2 秒 | 20 次 |
-| `TiktokEventsJob` | 2 秒 | 8 次 |
-
-#### B. Agent Bot Webhook 重试
-- HTTP 429 / 500：等待 3 秒，最多 3 次
-- 文件位置：`app/jobs/agent_bots/webhook_job.rb:3-8`
-
-### 4.3 消息状态流转模型
-
-**Message 状态枚举**：
-```ruby
-enum status: { sent: 0, delivered: 1, read: 2, failed: 3 }
-```
-- 文件位置：`app/models/message.rb:103`
-
-**状态更新服务**：`Messages::StatusUpdateService`
-- 文件位置：`app/services/messages/status_update_service.rb:1-34`
-- 仅允许 `failed` 状态时设置 `external_error`
-
----
-
-## 5. 多渠道重试设计方案（建议）
-
-基于现有架构的不足，设计统一的多渠道重试框架。
-
-### 5.1 设计目标
-1. **统一抽象**：所有出站操作共享一致的重试语义
-2. **分类处理**：按错误类型区分可重试/不可重试
-3. **幂等保障**：接收方可以安全处理重复投递
-4. **可观测性**：完整的监控、告警、追踪链路
-5. **渐进降级**：重试耗尽后有明确的业务降级策略
-
----
-
-### 5.2 错误分类：可重试 vs 不可重试
-
-#### 分类矩阵
-
-| 错误类别 | 错误类型 | 可重试？ | 重试策略 | 降级策略 |
-|----------|----------|----------|----------|----------|
-| **网络传输层** | `Net::OpenTimeout` | ✅ 是 | 指数退避 | 无 |
-| | `Net::ReadTimeout` | ✅ 是 | 指数退避 | 无 |
-| | `SocketError` | ✅ 是 | 指数退避 | 无 |
-| | `OpenSSL::SSL::SSLError` | ⚠️ 条件 | 固定间隔（3次） | 证书错误则放弃 |
-| | `SafeFetch::FetchError` | ✅ 是 | 指数退避 | 无 |
-| **HTTP 4xx** | 400 Bad Request | ❌ 否 | - | 记录，丢弃 |
-| | 401 Unauthorized | ❌ 否 | - | 禁用集成/提示重授权 |
-| | 403 Forbidden | ❌ 否 | - | 禁用集成/提示重授权 |
-| | 404 Not Found | ❌ 否 | - | 记录，丢弃 |
-| | 408 Request Timeout | ✅ 是 | 指数退避 | 无 |
-| | 429 Too Many Requests | ✅ 是 | 带抖动的指数退避 | 无（读取 Retry-After） |
-| **HTTP 5xx** | 500 Internal Server Error | ✅ 是 | 指数退避 | 无 |
-| | 502 Bad Gateway | ✅ 是 | 指数退避 | 无 |
-| | 503 Service Unavailable | ✅ 是 | 指数退避 | 无 |
-| | 504 Gateway Timeout | ✅ 是 | 指数退避 | 无 |
-| **业务逻辑层** | 无效签名/认证 | ❌ 否 | - | 提示重新配置 |
-| | 资源不存在（渠道侧） | ❌ 否 | - | 禁用集成 |
-| | 配额耗尽 | ⚠️ 条件 | 长时间延迟重试 | 告警通知管理员 |
-| **并发控制层** | 锁获取失败 | ✅ 是 | 固定间隔 | 无（8次后进入死信） |
-
----
-
-### 5.3 退避策略设计
-
-#### 策略选型
-
-| 策略类型 | 算法 | 适用场景 | 示例（最大重试 5 次） |
-|----------|------|----------|----------------------|
-| **指数退避** | `wait = base * (2^attempt)` | 网络抖动、服务限流 | 1s, 2s, 4s, 8s, 16s |
-| **指数退避 + 抖动** | `wait = base * (2^attempt) * random(0.5, 1.5)` | 大规模并发场景（避免重试风暴） | 0.8s, 1.7s, 3.5s, 7.8s, 14.2s |
-| **固定间隔** | `wait = constant` | 锁竞争、简单场景 | 3s, 3s, 3s, 3s, 3s |
-| **线性退避** | `wait = base * attempt` | 逐步增加等待 | 1s, 2s, 3s, 4s, 5s |
-
-#### 建议配置
 
 ```ruby
-# 统一重试配置（建议新增 config/initializers/outbound_retries.rb）
-
-RETRY_CONFIG = {
-  network: {
-    strategy: :exponential_backoff_with_jitter,
-    base: 1.second,
-    max_attempts: 5,
-    max_delay: 30.seconds
-  },
-  http_429: {
-    strategy: :exponential_backoff_with_jitter,
-    base: 2.seconds,
-    max_attempts: 8,
-    max_delay: 60.seconds,
-    respect_retry_after: true  # 读取响应头 Retry-After
-  },
-  http_5xx: {
-    strategy: :exponential_backoff,
-    base: 1.second,
-    max_attempts: 5,
-    max_delay: 30.seconds
-  },
-  lock_acquisition: {
-    strategy: :fixed,
-    delay: 1.second,
-    max_attempts: 8
-  },
-  ssl_error: {
-    strategy: :fixed,
-    delay: 5.seconds,
-    max_attempts: 3
-  }
-}.freeze
-```
-
-#### 指数退避 + 抖动实现
-```ruby
-def exponential_backoff_with_jitter(attempt, base = 1.second, max_delay = 30.seconds)
-  exponential_wait = base * (2 ** attempt)
-  jitter = rand(0.5..1.5)
-  [exponential_wait * jitter, max_delay].min
+# Webhooks::Trigger 需要修改以支持普通 Webhook 的重试分类
+def classify_error(error)
+  # 所有 Webhook 类型都应该区分可重试/不可重试
+  status = http_status(error)
+  
+  if [408, 429, 500, 502, 503, 504].include?(status)
+    :transient
+  elsif NETWORK_ERRORS.any? { |e| error.is_a?(e) }
+    :transient
+  elsif [401, 403, 404].include?(status)
+    :permanent
+  else
+    :transient  # 未知错误视为临时性错误，给一次重试机会
+  end
 end
 ```
 
 ---
 
-### 5.4 幂等键设计
+### 4.5 方案三：Slack 发送修复
 
-#### 现有幂等标识
+#### 当前问题
+- HookJob 的 `rescue StandardError => e` 吞掉所有异常
+- Slack 发送失败（如网络超时、429、5xx）完全不重试
+- 用户无法知道 Slack 通知失败了
 
-Chatwoot 已部分实现幂等支持：
-- **`X-Chatwoot-Delivery`**：UUID，每次 Webhook 请求唯一
-- **`message.id`**：消息唯一标识
-- **`conversation.id`**：对话唯一标识
+#### 改进方案
 
-#### 建议增强：统一幂等键规范
-
-**幂等键生成策略**：
 ```ruby
-# 建议新增 lib/outbound/idempotency_key.rb
+# 建议修改 app/jobs/hook_job.rb
+
+class HookJob < MutexApplicationJob
+  retry_on LockAcquisitionError, wait: 3.seconds, attempts: 3
+  
+  queue_as :medium
+  
+  # 关闭 Sidekiq 默认重试
+  sidekiq_options retry: 0
+  
+  def perform(hook, event_name, event_data = {})
+    return if hook.disabled?
+
+    case hook.app_id
+    when 'slack'
+      process_slack_integration(hook, event_name, event_data)
+    when 'dialogflow'
+      process_dialogflow_integration(hook, event_name, event_data)
+    when 'google_translate'
+      google_translate_integration(hook, event_name, event_data)
+    when 'leadsquared'
+      process_leadsquared_integration_with_lock(hook, event_name, event_data)
+    end
+  # 移除 rescue StandardError！让异常透传到子作业
+  end
+  
+  # ...
+end
+```
+
+```ruby
+# 建议修改 app/jobs/send_on_slack_job.rb
+
+class SendOnSlackJob < MutexApplicationJob
+  queue_as :medium
+  
+  # 关闭 Sidekiq 默认重试
+  sidekiq_options retry: 0
+  
+  # 锁竞争：固定间隔重试
+  retry_on LockAcquisitionError, wait: 1.second, attempts: 8
+  
+  # Slack API 限流：指数退避 + 抖动
+  retry_on Slack::Web::Api::Errors::TooManyRequestsError,
+           wait: ->(executions) { [2.seconds * (2**executions) * rand(0.5..1.5), 120.seconds].min },
+           attempts: 10 do |job, error|
+    Metrics.increment('outbound_slack_rate_limited')
+    Alerting.trigger(:slack_integration_failing, hook_id: job.hook_id)
+  end
+  
+  # 网络错误和 5xx：指数退避
+  retry_on Slack::Web::Api::Errors::ServiceUnavailable,
+           Slack::Web::Api::Errors::InternalError,
+           Faraday::TimeoutError,
+           Faraday::ConnectionFailed,
+           wait: ->(executions) { [1.second * (2**executions), 30.seconds].min },
+           attempts: 5 do |job, error|
+    Metrics.increment('outbound_slack_retry_exhausted')
+    Alerting.trigger(:slack_integration_failing, hook_id: job.hook_id)
+  end
+  
+  # 致命错误：直接禁用集成
+  discard_on Slack::Web::Api::Errors::IsArchived,
+             Slack::Web::Api::Errors::AccountInactive,
+             Slack::Web::Api::Errors::MissingScope,
+             Slack::Web::Api::Errors::InvalidAuth,
+             Slack::Web::Api::Errors::ChannelNotFound,
+             Slack::Web::Api::Errors::NotInChannel do |job, error|
+    message, hook = job.arguments
+    hook.disable
+    hook.prompt_reauthorization!
+    Rails.logger.error "Slack hook disabled: #{error.message}"
+    Alerting.trigger(:slack_integration_disabled, hook_id: hook.id)
+  end
+  
+  def perform(message, hook)
+    key = format(::Redis::Alfred::SLACK_MESSAGE_MUTEX, conversation_id: message.conversation_id, reference_id: hook.reference_id)
+    with_lock(key) do
+      Integrations::Slack::SendOnSlackService.new(message: message, hook: hook).perform
+    end
+  end
+end
+```
+
+---
+
+### 4.6 方案四：幂等键设计（配合重试）
+
+#### 原则
+重试必须配合幂等，否则可能产生副作用。
+
+#### 幂等键规范
+
+| 通知类型 | 幂等键格式 | 存储位置 | TTL |
+|----------|-----------|----------|-----|
+| Webhook (所有类型) | `webhook:{delivery_id}` | 请求头 `X-Chatwoot-Delivery` | 24h |
+| Slack 发送 | `slack:{conversation_id}:{hook_reference_id}` | Redis 锁 + 成功标记 | 24h |
+| 渠道消息 | `channel:{channel_type}:{message_id}` | Redis 成功标记 | 24h |
+| Agent Bot | `bot:{bot_id}:{event}:{entity_id}` | Redis 成功标记 | 24h |
+
+#### 发送端幂等保障
+```ruby
+# 建议新增 lib/outbound/idempotent_sender.rb
 
 module Outbound
-  class IdempotencyKey
-    # Webhook 幂等键：delivery_id（已存在，保持兼容）
-    def self.for_webhook(delivery_id)
-      "webhook:#{delivery_id}"
-    end
-
-    # 渠道消息幂等键：消息 ID + 渠道类型
-    def self.for_channel_message(message_id, channel_type)
-      "channel:#{channel_type}:#{message_id}"
-    end
-
-    # Slack 消息幂等键：对话 ID + Hook 引用 ID
-    def self.for_slack(conversation_id, reference_id)
-      "slack:#{conversation_id}:#{reference_id}"
-    end
-
-    # Agent Bot 幂等键：机器人 ID + 事件类型 + 实体 ID
-    def self.for_agent_bot(bot_id, event, entity_id)
-      "bot:#{bot_id}:#{event}:#{entity_id}"
+  module IdempotentSender
+    def with_idempotency_guarantee(idempotency_key, &block)
+      # 1. 检查是否已成功投递
+      success_key = "outbound:success:#{idempotency_key}"
+      if Rails.cache.exist?(success_key)
+        Rails.logger.info "[Idempotency] Skipping duplicate: #{idempotency_key}"
+        return
+      end
+      
+      # 2. 获取发送锁（防止并发重复发送）
+      lock_key = "outbound:lock:#{idempotency_key}"
+      lock_manager = Redis::LockManager.new
+      
+      if lock_manager.lock(lock_key, 5.minutes)
+        begin
+          yield
+          # 3. 成功后标记
+          Rails.cache.write(success_key, true, expires_in: 24.hours)
+        ensure
+          lock_manager.unlock(lock_key)
+        end
+      else
+        Rails.logger.info "[Idempotency] Lock held, skipping: #{idempotency_key}"
+      end
     end
   end
 end
 ```
 
-#### 接收方幂等处理建议
-
+#### 接收端幂等处理（文档建议）
 ```
 接收方实现步骤：
 1. 读取请求头 X-Chatwoot-Delivery
-2. 查询本地幂等表/缓存是否已处理该 ID
-3. 如已处理，返回 200 OK 但不重复执行业务逻辑
-4. 如未处理，执行业务逻辑并记录幂等 ID
-5. 幂等记录 TTL：建议 24 小时（覆盖最长重试周期）
+2. 检查本地幂等表/缓存：已处理？
+3. 已处理 → 返回 200 OK，不执行业务逻辑
+4. 未处理 → 执行业务逻辑 + 记录幂等 ID
+5. 幂等记录 TTL：建议 24 小时
 
 数据库表设计（可选）：
 CREATE TABLE idempotent_deliveries (
@@ -551,88 +679,34 @@ CREATE TABLE idempotent_deliveries (
 );
 ```
 
-#### Redis 分布式锁 + 幂等双重保障
-```ruby
-# 发送前检查
-def with_idempotency_guarantee(idempotency_key)
-  # 1. 检查是否已成功投递
-  if Rails.cache.exist?("outbound:success:#{idempotency_key}")
-    Rails.logger.info "[Idempotency] Skipping duplicate: #{idempotency_key}"
-    return
-  end
-
-  # 2. 获取发送锁（防止并发重复发送）
-  lock_key = "outbound:lock:#{idempotency_key}"
-  lock_manager = Redis::LockManager.new
-
-  if lock_manager.lock(lock_key, 5.minutes)
-    begin
-      yield
-      # 3. 成功后标记（TTL 24 小时）
-      Rails.cache.write("outbound:success:#{idempotency_key}", true, expires_in: 24.hours)
-    ensure
-      lock_manager.unlock(lock_key)
-    end
-  else
-    Rails.logger.info "[Idempotency] Lock held, skipping: #{idempotency_key}"
-  end
-end
-```
-
 ---
 
-### 5.5 告警落点设计
+### 4.7 方案五：告警体系
 
-#### 告警层次
+#### 告警指标
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                        告警层次架构                            │
-├─────────────────────────────────────────────────────────────┤
-│  Level 1: 实时告警 (P1)                                       │
-│  ├── 连续失败 > 阈值（如 10 次/5 分钟）                          │
-│  ├── 关键渠道可用性下降（如 WhatsApp 5xx 率 > 5%）              │
-│  └── 死信队列新增高优先级消息                                   │
-├─────────────────────────────────────────────────────────────┤
-│  Level 2: 小时级告警 (P2)                                      │
-│  ├── Webhook 失败率 > 10%                                     │
-│  ├── 平均重试次数 > 3 次                                       │
-│  └── Agent Bot 降级触发次数 > 阈值                              │
-├─────────────────────────────────────────────────────────────┤
-│  Level 3: 日报告警 (P3)                                       │
-│  ├── 各渠道投递成功率汇总                                       │
-│  ├── 死信队列规模                                              │
-│  └── 重试资源消耗分析                                          │
-└─────────────────────────────────────────────────────────────┘
-```
+| 指标名 | 类型 | 阈值 | 级别 | 标签 |
+|--------|------|------|------|------|
+| `outbound_webhook_retry_exhausted_total` | Counter | > 10/5min | P2 | webhook_type, account_id |
+| `outbound_webhook_failure_rate` | Gauge | > 10% | P2 | webhook_type, account_id |
+| `outbound_slack_retry_exhausted_total` | Counter | > 5/10min | P1 | hook_id, account_id |
+| `outbound_channel_delivery_success_rate` | Gauge | < 95% | P1 | channel_type, account_id |
+| `outbound_bot_downgrade_total` | Counter | > 10/hour | P2 | bot_id, account_id |
+| `outbound_double_retry_detected` | Counter | > 0 | P1 | job_type |
 
-#### 告警指标定义
-
-| 指标名 | 类型 | 告警阈值 | 告警级别 | 标签维度 |
-|--------|------|----------|----------|----------|
-| `outbound_webhook_failure_rate` | Gauge | > 10% (5m) | P2 | account_id, webhook_type |
-| `outbound_channel_delivery_success_rate` | Gauge | < 95% (5m) | P1 | channel_type, account_id |
-| `outbound_retry_count_total` | Counter | - | - | channel_type, error_type |
-| `outbound_dlq_size` | Gauge | > 100 | P1 | priority |
-| `outbound_dead_letter_total` | Counter | - | - | job_type, reason |
-| `outbound_bot_downgrade_total` | Counter | > 10/hour | P2 | account_id, bot_id |
-| `outbound_lock_contention_total` | Counter | - | - | lock_type |
-
-#### 告警实现示例（Prometheus + AlertManager）
-
+#### 告警规则（Prometheus）
 ```yaml
-# alertmanager.yml 示例规则
 groups:
   - name: outbound_notifications
     rules:
-      - alert: CriticalChannelDeliveryFailure
-        expr: outbound_channel_delivery_success_rate{channel_type=~"whatsapp|twilio"} < 0.95
+      - alert: SlackIntegrationFailing
+        expr: increase(outbound_slack_retry_exhausted_total[10m]) > 5
         for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "关键渠道投递成功率低于 95%"
-          description: "渠道 {{ $labels.channel_type }} 成功率: {{ $value | humanizePercentage }}"
+          summary: "Slack 集成连续失败"
+          description: "Hook {{ $labels.hook_id }} 重试耗尽 {{ $value }} 次"
 
       - alert: WebhookHighFailureRate
         expr: outbound_webhook_failure_rate > 0.10
@@ -643,311 +717,192 @@ groups:
           summary: "Webhook 失败率超过 10%"
           description: "类型 {{ $labels.webhook_type }} 失败率: {{ $value | humanizePercentage }}"
 
-      - alert: DeadLetterQueueGrowing
-        expr: outbound_dlq_size{priority="high"} > 100
-        for: 10m
+      - alert: ChannelDeliveryDegraded
+        expr: outbound_channel_delivery_success_rate < 0.95
+        for: 5m
         labels:
           severity: critical
         annotations:
-          summary: "高优先级死信队列堆积"
-          description: "当前队列大小: {{ $value }}"
-```
+          summary: "渠道投递成功率低于 95%"
+          description: "渠道 {{ $labels.channel_type }} 成功率: {{ $value | humanizePercentage }}"
 
-#### 告警落点矩阵
-
-| 失败场景 | 日志 | Metrics | Sentry | 业务告警 | 死信队列 |
-|----------|------|---------|--------|----------|----------|
-| 网络超时/连接错误 | ✅ | `outbound_retry_count_total` | ❌ | 小时级汇总 | 重试耗尽后 |
-| HTTP 429 限流 | ✅ | `outbound_retry_count_total` | ❌ | 阈值触发 | 重试耗尽后 |
-| HTTP 401/403 认证错误 | ✅ | `outbound_auth_failure_total` | ✅ | 实时告警 | 立即进入 |
-| HTTP 5xx 服务端错误 | ✅ | `outbound_retry_count_total` | ❌ | 小时级汇总 | 重试耗尽后 |
-| Slack 集成禁用 | ✅ | `outbound_integration_disabled_total` | ✅ | 实时告警 | - |
-| Agent Bot 降级 | ✅ | `outbound_bot_downgrade_total` | ❌ | 阈值触发 | - |
-| 死信队列新增 | ✅ | `outbound_dead_letter_total` | - | 实时告警 | - |
-
----
-
-### 5.6 死信队列（DLQ）设计
-
-#### DLQ 触发条件
-```
-1. 重试次数耗尽（按策略达到 max_attempts）
-2. 遇到不可重试的致命错误（401, 403, 404 等）
-3. 作业反序列化失败（ActiveJob::DeserializationError）
-4. 人工手动移入（运营操作）
-```
-
-#### DLQ 数据模型
-```ruby
-# 建议新增 app/models/outbound_dead_letter.rb
-
-class OutboundDeadLetter < ApplicationRecord
-  enum priority: { high: 0, medium: 1, low: 2 }
-  enum status: { pending: 0, resolved: 1, discarded: 2 }
-
-  # 序列化的作业参数
-  store :job_payload, accessors: [:job_class, :arguments, :executions], coder: JSON
-
-  # 错误信息
-  store :error_info, accessors: [:error_class, :error_message, :backtrace], coder: JSON
-
-  # 分类标签
-  store :tags, accessors: [:channel_type, :webhook_type, :account_id, :inbox_id], coder: JSON
-end
-```
-
-#### DLQ 运营流程
-```
-┌─────────────┐     ┌──────────────┐     ┌──────────────┐
-│  重试耗尽    │────▶│  进入 DLQ     │────▶│  人工审核     │
-└─────────────┘     └──────────────┘     └──────┬───────┘
-                                                │
-                        ┌───────────────────────┼───────────────────────┐
-                        ▼                       ▼                       ▼
-                  ┌──────────┐           ┌──────────┐           ┌──────────┐
-                  │ 重新投递  │           │  修改参数  │           │  丢弃     │
-                  │ (retry)  │           │ (edit)   │           │ (discard) │
-                  └──────────┘           └──────────┘           └──────────┘
+      - alert: DoubleRetryDetected
+        expr: increase(outbound_double_retry_detected_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "检测到双重重试！"
+          description: "作业 {{ $labels.job_type }} 存在业务层+队列层双重重试"
 ```
 
 ---
 
-## 6. 重试方案实现建议
+### 4.8 方案六：双重重试检测机制
 
-### 6.1 对现有代码的最小改动
+#### 问题
+如何确保业务层重试耗尽后，Sidekiq 不会再次重试？
 
-#### 改动点 1：增强 Webhooks::Trigger
+#### 检测方案
 ```ruby
-# lib/webhooks/trigger.rb（修改建议）
+# 建议新增 config/initializers/sidekiq_retry_monitor.rb
 
-class Webhooks::Trigger
-  RETRYABLE_HTTP_STATUSES = [408, 429, 500, 502, 503, 504].freeze
-
-  def execute
-    perform_request
-  rescue SafeFetch::FetchError => e
-    # 网络错误：可重试
-    raise RetryableError.new(status: nil, message: e.message)
-  rescue SafeFetch::HttpError => e
-    status = http_status(e)
-    if RETRYABLE_HTTP_STATUSES.include?(status)
-      raise RetryableError.new(status: status, message: e.message)
-    else
-      handle_failure(e)  # 不可重试，直接处理
-    end
-  rescue StandardError => e
-    handle_failure(e)
+# 监控是否有作业既配置了 retry_on 又没关闭 Sidekiq 默认重试
+Sidekiq.configure_server do |config|
+  config.server_middleware do |chain|
+    chain.add DoubleRetryDetectionMiddleware
   end
 end
-```
 
-#### 改动点 2：增强 WebhookJob 重试
-```ruby
-# app/jobs/webhook_job.rb（修改建议）
-
-class WebhookJob < ApplicationJob
-  queue_as :medium
-
-  RETRY_CONFIG = {
-    network: { wait: :exponential, attempts: 5 },
-    http_retryable: { wait: :exponential, attempts: 5 },
-    http_429: { wait: :exponential_with_jitter, attempts: 8 }
-  }.freeze
-
-  retry_on Webhooks::Trigger::RetryableError do |job, error|
-    if error.status == 429
-      # 限流：检查 Retry-After 头
-      retry_after = extract_retry_after(error.message)
-      retry_job wait: retry_after if retry_after
+class DoubleRetryDetectionMiddleware
+  def call(worker, job, queue)
+    # 检测条件：
+    # 1. 作业有 retry_on 配置（ActiveJob）
+    # 2. Sidekiq retry 没有被关闭（retry != 0）
+    
+    if job['class'].safe_constantize&.respond_to?(:retry_on_callbacks) &&
+       job['class'].safe_constantize&.retry_on_callbacks&.any? &&
+       job['retry'] != 0
+      
+      Rails.logger.warn "[DoubleRetry] Detected potential double retry: #{job['class']}"
+      Metrics.increment('outbound_double_retry_detected', tags: { job_type: job['class'] })
+      Alerting.trigger(:double_retry_risk, job_class: job['class'])
     end
-    # 其他情况由 ActiveJob 按策略重试
-  end
-
-  after_retry do |job, error|
-    Metrics.increment('outbound_retry_count_total', tags: {
-      job_class: job.class.name,
-      error_class: error.class.name
-    })
-  end
-
-  discard_on ActiveJob::DeserializationError do |job, error|
-    DeadLetterQueue.push(job, error, reason: :deserialization)
-  end
-
-  def perform(url, payload, webhook_type = :account_webhook, secret: nil, delivery_id: nil)
-    Webhooks::Trigger.execute(url, payload, webhook_type, secret: secret, delivery_id: delivery_id)
-  rescue StandardError => e
-    # 重试耗尽后
-    DeadLetterQueue.push(self, e, reason: :retries_exhausted, tags: { webhook_type: webhook_type })
-    Metrics.increment('outbound_dead_letter_total', tags: { webhook_type: webhook_type })
-    raise
-  end
-end
-```
-
-#### 改动点 3：统一渠道服务异常处理
-```ruby
-# 建议新增 app/services/concerns/channel_retryable.rb
-
-module ChannelRetryable
-  extend ActiveSupport::Concern
-
-  included do
-    class_attribute :retry_config, default: {
-      network_errors: [Net::OpenTimeout, Net::ReadTimeout, SocketError],
-      max_attempts: 5,
-      backoff_strategy: :exponential
-    }
-  end
-
-  def with_retry(&block)
-    attempt = 0
-    begin
-      yield
-    rescue *retry_config[:network_errors] => e
-      attempt += 1
-      if attempt <= retry_config[:max_attempts]
-        wait = calculate_backoff(attempt)
-        Metrics.increment('outbound_retry_count_total', tags: {
-          channel: channel_name,
-          error: e.class.name
-        })
-        sleep(wait)
-        retry
-      else
-        handle_permanent_failure(e)
-      end
-    rescue StandardError => e
-      handle_permanent_failure(e)
-    end
-  end
-
-  private
-
-  def calculate_backoff(attempt)
-    case retry_config[:backoff_strategy]
-    when :exponential
-      [1.second * (2**attempt), 30.seconds].min
-    when :exponential_with_jitter
-      base = 1.second * (2**attempt)
-      [base * rand(0.5..1.5), 30.seconds].min
-    else
-      retry_config[:backoff_strategy].call(attempt)
-    end
-  end
-
-  def handle_permanent_failure(error)
-    Messages::StatusUpdateService.new(message, 'failed', error.message).perform
-    ChatwootExceptionTracker.new(error, account: message.account).capture_exception
-    Metrics.increment('outbound_channel_delivery_failed', tags: { channel: channel_name })
+    
+    yield
   end
 end
 ```
 
 ---
 
-## 7. 关键设计模式
+## 5. 治理方案总结
 
-### 7.1 模板方法模式
-- `Base::SendOnChannelService` 定义渠道发送服务的骨架
-- 子类实现 `channel_class` 和 `perform_reply`
+### 5.1 实施优先级
 
-### 7.2 事件驱动架构
-- 使用 ActiveRecord callbacks + Wisper 事件系统
-- 监听器解耦业务逻辑和通知逻辑
+| 优先级 | 方案 | 改动量 | 风险 | 收益 |
+|--------|------|--------|------|------|
+| P0 | 移除 HookJob 的 `rescue StandardError` | 小 | 中 | Slack 发送失败可被观察 |
+| P0 | Agent Bot 重试增强（网络错误 + 5xx） | 中 | 低 | 修复最关键的重试缺口 |
+| P1 | 普通 Webhook 新增重试 | 中 | 低 | 减少通知丢失 |
+| P1 | 关键作业配置 `sidekiq_options retry: 0` | 小 | 低 | 避免双重重试 |
+| P1 | 告警体系建设 | 中 | 低 | 可观测性提升 |
+| P2 | 幂等键完善 | 大 | 中 | 安全重试的基础 |
+| P2 | 双重重试检测中间件 | 小 | 低 | 预防未来问题 |
 
-### 7.3 分布式锁
-- 使用 Redis 实现互斥锁
-- 防止并发消息导致的重复投递或时序问题
+### 5.2 重试配置规范（实施后）
 
-### 7.4 分层错误处理
-- **传输层**：网络错误、超时
-- **业务层**：HTTP 状态码、API 错误码
-- **策略层**：区分可重试和不可重试错误
+```ruby
+# 所有出站作业的标准配置模板
 
----
-
-## 8. 总结
-
-### 8.1 现有架构核心特点
-1. **异步优先**：所有出站操作均通过 Sidekiq 异步处理
-2. **三层回调**：账户级、API 渠道、Agent Bot 各自独立
-3. **差异化重试**：Agent Bot 有重试，其他基本没有
-4. **分布式锁**：关键路径使用 Redis 锁保证顺序性
-5. **可观测性不足**：缺少统一的 metrics 和告警体系
-
-### 8.2 现有重试策略矩阵
-
-| 通知类型 | 作业队列 | 重试机制 | 最大重试 | 失败后处理 |
-|----------|----------|----------|----------|------------|
-| 渠道消息 (SendReplyJob) | high | 无自动重试 | - | 更新消息状态为 failed |
-| Slack 通知 | medium | 锁获取失败重试 | 8 次 | 致命错误禁用集成 |
-| 账户级 Webhook | medium | 无重试 | - | 仅记录日志 |
-| API 渠道回调 | medium | 无重试 | - | 消息事件失败时标记 failed |
-| Agent Bot Webhook | high | HTTP 429/500 重试 | 3 次 | 对话转 open，记录活动 |
-| Hook 集成 | medium | 锁获取失败重试 | 3 次 | 捕获异常记录日志 |
-
-### 8.3 建议方案核心改进
-
-#### 错误分类
-- **可重试**：网络错误（超时、连接失败）、HTTP 408/429/5xx
-- **不可重试**：HTTP 400/401/403/404、认证错误、配置错误
-
-#### 退避策略
-- **网络/5xx**：指数退避（1s, 2s, 4s, 8s, 16s），最大 5 次
-- **429 限流**：指数退避 + 抖动，最大 8 次，支持 `Retry-After` 头
-- **锁竞争**：固定间隔 1 秒，最大 8 次
-
-#### 幂等设计
-- **发送端**：`X-Chatwoot-Delivery` + Redis 锁 + 成功标记缓存
-- **接收端**：建议实现幂等表或缓存检查
-
-#### 告警体系
-- **P1 实时**：关键渠道成功率 < 95%、死信队列堆积
-- **P2 小时级**：Webhook 失败率 > 10%、Bot 降级频繁
-- **P3 日报**：成功率汇总、重试资源消耗分析
-
-#### 死信队列
-- 重试耗尽、致命错误、反序列化失败时进入
-- 支持人工审核、重新投递、修改参数、丢弃操作
+class OutboundJobTemplate < ApplicationJob
+  # 1. 明确关闭 Sidekiq 默认重试
+  sidekiq_options retry: 0
+  
+  # 2. 按异常类型分层重试
+  retry_on TransientError, 
+           wait: ->(n) { [1.second * (2**n), 30.seconds].min },
+           attempts: 5 do |job, error|
+    # 3. exhaustion block 必须吸收异常
+    Metrics.increment('retry_exhausted')
+    Alerting.trigger(:job_failing, job_id: job.job_id)
+    handle_permanent_failure(error)
+    # 没有 raise！
+  end
+  
+  retry_on RateLimitError,
+           wait: ->(n) { [2.seconds * (2**n) * rand(0.5..1.5), 120.seconds].min },
+           attempts: 8 do |job, error|
+    Metrics.increment('rate_limited')
+    handle_permanent_failure(error)
+  end
+  
+  # 4. 不可重试的错误直接丢弃
+  discard_on PermanentError do |job, error|
+    Metrics.increment('permanent_failure')
+    disable_integration if auth_error?(error)
+  end
+  
+  def perform(*args)
+    # 5. 幂等保障
+    with_idempotency_guarantee(idempotency_key(args)) do
+      do_work(*args)
+    end
+  end
+end
+```
 
 ---
 
-## 9. 附录
+## 6. 附录
 
-### 9.1 关键代码位置索引
+### 6.1 关键代码位置索引
 
 | 组件 | 文件路径 |
 |------|----------|
-| Webhook 模型 | `app/models/webhook.rb` |
-| API 渠道模型 | `app/models/channel/api.rb` |
-| Agent Bot 模型 | `app/models/agent_bot.rb` |
-| Webhook 监听器 | `app/listeners/webhook_listener.rb` |
-| Agent Bot 监听器 | `app/listeners/agent_bot_listener.rb` |
-| Webhook 作业 | `app/jobs/webhook_job.rb` |
-| Agent Bot 作业 | `app/jobs/agent_bots/webhook_job.rb` |
-| Webhook 触发器 | `lib/webhooks/trigger.rb` |
-| SendReplyJob | `app/jobs/send_reply_job.rb` |
-| 消息状态服务 | `app/services/messages/status_update_service.rb` |
-| 账户设置 Schema | `app/models/concerns/account_settings_schema.rb` |
-| Sidekiq 配置 | `config/initializers/sidekiq.rb` |
+| Webhook 触发器（核心异常处理） | `lib/webhooks/trigger.rb` |
+| Agent Bot Webhook 作业 | `app/jobs/agent_bots/webhook_job.rb` |
+| 普通 Webhook 作业 | `app/jobs/webhook_job.rb` |
+| Hook 作业（Slack 入口） | `app/jobs/hook_job.rb` |
+| Slack 发送作业 | `app/jobs/send_on_slack_job.rb` |
+| Slack 发送服务 | `lib/integrations/slack/send_on_slack_service.rb` |
+| 多渠道发送入口 | `app/jobs/send_reply_job.rb` |
+| 应用作业基类 | `app/jobs/application_job.rb` |
+| 互斥锁作业基类 | `app/jobs/mutex_application_job.rb` |
+| 双重重试示例（好的实践） | `enterprise/app/jobs/captain/documents/perform_sync_job.rb` |
 
-### 9.2 消息状态流转
+### 6.2 SafeFetch 异常分类
+
+```ruby
+# lib/safe_fetch.rb:17-24
+class Error < StandardError; end
+class InvalidUrlError < Error; end
+class UnsafeUrlError < Error; end
+class FetchError < Error; end       # ← 网络超时、连接错误、SSL 错误
+class HttpError < Error; end        # ← HTTP 非 2xx 响应
+class FileTooLargeError < Error; end
+class UnsupportedContentTypeError < Error; end
+class UnsupportedMethodError < Error; end
+```
+
+### 6.3 消息状态流转
 
 ```
 sent (0) ──▶ delivered (1) ──▶ read (2)
    │
-   └──▶ failed (3)  [可由 Webhook/渠道失败触发]
+   └──▶ failed (3)  [可由 Webhook 失败/渠道失败触发]
 ```
 
-### 9.3 对话状态流转（Agent Bot 相关）
+### 6.4 当前重试策略全景图（修订前）
 
 ```
-pending (机器人处理中)
-    │
-    ├──▶ bot 响应成功 ──▶ 继续等待或 resolved
-    │
-    └──▶ 重试耗尽 + keep_pending_on_bot_failure = false
-          │
-          └──▶ open (转人工处理) + 活动消息记录
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        出站通知重试全景（修订前）                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Agent Bot Webhook                                                        │
+│  ├── retry_on: HTTP 429/500 → 3 次（固定 3s）                             │
+│  ├── 网络超时/502/503/504 → 吞错不重试 ❌                                 │
+│  └── exhaustion block: 对话转 open（可配置）                               │
+│                                                                          │
+│  普通 Webhook (account/api)                                               │
+│  ├── retry_on: 无 ❌                                                      │
+│  ├── 所有异常 → Webhooks::Trigger#handle_failure → 吞掉                    │
+│  └── 终态: 记录日志（消息事件会更新 status=failed）                         │
+│                                                                          │
+│  Slack 发送                                                                │
+│  ├── retry_on: LockAcquisitionError → 8 次（锁竞争）                       │
+│  ├── 其他异常 → HookJob#rescue StandardError → 吞掉 ❌                     │
+│  └── 致命错误（IsArchived 等）→ 禁用集成                                   │
+│                                                                          │
+│  多渠道消息 (SendReplyJob)                                                 │
+│  ├── retry_on: 无 ❌                                                       │
+│  ├── 各 SendOn*Service 自己 rescue → 吞掉                                  │
+│  └── 终态: 消息 status=failed                                              │
+│                                                                          │
+│  队列默认重试 (Sidekiq)                                                    │
+│  ├── 理论上: 25 次指数退避                                                 │
+│  └── 实际上: 由于到处都是 rescue，几乎不会触发 😱                           │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
