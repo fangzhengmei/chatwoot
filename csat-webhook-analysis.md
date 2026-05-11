@@ -489,9 +489,12 @@ end
 | **前端入口** | `CustomerSatisfaction.vue`（共享组件） | `Response.vue`（独立页面） |
 | **身份识别** | Message ID（数据库自增 ID） | Conversation UUID |
 | **API 端点** | `/api/v1/widget/messages/:id` | `/public/api/v1/csat_survey/:uuid` |
-| **HTTP 方法** | PATCH | PUT |
-| **控制器** | `Public::Api::V1::Inboxes::MessagesController` | `Public::Api::V1::CsatSurveyController` |
-| **参数结构** | `submitted_values: {...}` | `message: { submitted_values: {...} }` |
+| **HTTP 方法** | **PATCH** | **PUT** |
+| **控制器** | `Api::V1::Widget::MessagesController` | `Public::Api::V1::CsatSurveyController` |
+| **控制器基类** | `Api::V1::Widget::BaseController` | `PublicController` |
+| **参数结构** | `contact: { email }, message: { submitted_values: {...} }` | `message: { submitted_values: {...} }` |
+| **14 天锁检查** | **无** | 有 |
+| **CORS 支持** | 依赖 `ENABLE_API_CORS=true` 或开发环境 | 无条件支持（`/public/api/*`） |
 | **后续流程** | 相同（事件驱动 → ResponseBuilder） | 相同（事件驱动 → ResponseBuilder） |
 
 ---
