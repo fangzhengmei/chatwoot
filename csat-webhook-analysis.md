@@ -21,7 +21,7 @@ class CsatSurveyListener < BaseListener
     return unless conversation.resolved?
     CsatSurveyService.new(conversation: conversation).perform
   end
-  
+
   def message_updated(event)
     message = extract_message_and_account(event)[0]
     return unless message.input_csat?
@@ -31,6 +31,20 @@ end
 ```
 
 **事件订阅**：监听 `conversation_status_changed` 事件，当对话状态变为 `resolved` 时触发 CSAT 发送流程。
+
+**监听器注册**：`app/dispatchers/async_dispatcher.rb:15`
+
+```ruby
+def listeners
+  [
+    AutomationRuleListener.instance,
+    CampaignListener.instance,
+    CsatSurveyListener.instance,  # 注册到异步分发器
+    HookListener.instance,
+    # ...
+  ]
+end
+```
 
 ---
 
@@ -100,9 +114,9 @@ class MessageTemplates::Template::CsatSurvey
       conversation.messages.create!(csat_survey_message_params)
     end
   end
-  
+
   private
-  
+
   def csat_survey_message_params
     {
       account_id: @conversation.account_id,
@@ -113,7 +127,7 @@ class MessageTemplates::Template::CsatSurvey
       content_attributes: content_attributes
     }
   end
-  
+
   def content_attributes
     {
       display_type: csat_config['display_type'] || 'emoji'  # emoji 或 star
@@ -124,9 +138,104 @@ end
 
 ---
 
-### 1.4 WhatsApp 模板发送
+### 1.4 CSAT 外链 URL 生成
 
-**WhatsApp 官方渠道**：`app/services/csat_survey_service.rb:107-135`
+#### 1.4.1 外链页面路由
+
+**路由配置**：`config/routes.rb:34-36`
+
+```ruby
+namespace :survey do
+  resources :responses, only: [:show]  # GET /survey/responses/:id
+end
+```
+
+**页面控制器**：`app/controllers/survey/responses_controller.rb:1-10`
+
+```ruby
+class Survey::ResponsesController < ActionController::Base
+  before_action :set_global_config
+  def show; end  # 渲染 SPA 页面
+
+  private
+
+  def set_global_config
+    @global_config = GlobalConfig.get('LOGO_THUMBNAIL', 'BRAND_NAME', 'WIDGET_BRAND_URL', 'INSTALLATION_NAME')
+  end
+end
+```
+
+#### 1.4.2 URL 生成逻辑
+
+**对话模型**：`app/models/conversation.rb:211-213`
+
+```ruby
+def csat_survey_link
+  "#{ENV.fetch('FRONTEND_URL', nil)}/survey/responses/#{uuid}"
+end
+```
+
+**消息内容 Presenter**：`app/presenters/message_content_presenter.rb:1-33`
+
+```ruby
+class MessageContentPresenter < SimpleDelegator
+  def outgoing_content
+    Messages::MarkdownRendererService.new(
+      content_with_survey_link,
+      conversation.inbox.channel_type,
+      conversation.inbox.channel
+    ).render
+  end
+
+  def webhook_content
+    Messages::WebhookContentNormalizer.normalize(content_with_survey_link)
+  end
+
+  private
+
+  def content_with_survey_link
+    if should_append_survey_link?
+      survey_link = survey_url(conversation.uuid)
+      custom_message = inbox.csat_config&.dig('message')
+      custom_message.present? ? "#{custom_message} #{survey_link}" : I18n.t('conversations.survey.response', link: survey_link)
+    else
+      content
+    end
+  end
+
+  def should_append_survey_link?
+    input_csat? && !inbox.web_widget?  # 非 Web Widget 渠道才附加外链
+  end
+
+  def survey_url(conversation_uuid)
+    "#{ENV.fetch('FRONTEND_URL', nil)}/survey/responses/#{conversation_uuid}"
+  end
+end
+```
+
+**邮件模板**：`app/views/mailers/conversation_reply_mailer/reply_with_summary.html.erb:13-14`
+
+```erb
+<% if (message.content_type == 'input_csat' && message.message_type == 'template') %>
+  <p>Click <a href="<%= message.conversation.csat_survey_link %>" _target="blank">here</a> to rate the conversation.</p>
+<% end %>
+```
+
+#### 1.4.3 URL 生成规则总结
+
+| 场景 | URL 格式 | 示例 |
+|------|---------|------|
+| 外链评分页 | `{FRONTEND_URL}/survey/responses/{conversation_uuid}` | `https://app.chatwoot.com/survey/responses/abc123-def456` |
+| Web Widget | 无外链，直接在会话内显示评分组件 | - |
+| WhatsApp 模板 | `{base_url}/survey/responses/{{1}}`（模板变量） | `https://app.chatwoot.com/survey/responses/{conversation_uuid}` |
+
+---
+
+### 1.5 WhatsApp 模板发送
+
+#### 1.5.1 官方 WhatsApp 渠道
+
+**发送逻辑**：`app/services/csat_survey_service.rb:107-155`
 
 ```ruby
 def send_whatsapp_template_survey
@@ -148,7 +257,34 @@ def build_template_info(template_name, template_config)
         type: 'button',
         sub_type: 'url',
         index: '0',
-        parameters: [{ type: 'text', text: conversation.uuid }]  # 传入对话 UUID
+        parameters: [{ type: 'text', text: conversation.uuid }]  # 传入对话 UUID 作为 URL 后缀
+      }
+    ]
+  }
+end
+```
+
+#### 1.5.2 模板创建
+
+**模板服务**：`app/services/whatsapp/csat_template_service.rb:61-96`
+
+```ruby
+def build_template_components(template_config)
+  [
+    build_body_component(template_config[:message]),
+    build_buttons_component(template_config)
+  ]
+end
+
+def build_buttons_component(template_config)
+  {
+    type: 'BUTTONS',
+    buttons: [
+      {
+        type: 'URL',
+        text: template_config[:button_text] || DEFAULT_BUTTON_TEXT,
+        url: "#{template_config[:base_url]}/survey/responses/{{1}}",  # 模板 URL 格式
+        example: ['12345']
       }
     ]
   }
@@ -157,9 +293,13 @@ end
 
 ---
 
-## 二、CSAT 评价表单展示
+## 二、CSAT 评价表单展示（两条路径）
 
-### 2.1 前端组件结构
+### 路径 A：Web Widget 会话内评分
+
+适用于 Web Widget 渠道，用户在聊天窗口内直接评分。
+
+#### 2.1 前端组件结构
 
 **消息气泡组件**：`app/javascript/widget/components/AgentMessageBubble.vue:61-150`
 
@@ -178,7 +318,7 @@ isCSAT() {
 />
 ```
 
-### 2.2 CSAT 评价组件
+#### 2.2 CSAT 评价组件
 
 **核心组件**：`app/javascript/shared/components/CustomerSatisfaction.vue:1-209`
 
@@ -213,7 +353,90 @@ methods: {
 
 ---
 
-## 三、跨域回调与数据提交
+### 路径 B：外链独立评分页
+
+适用于 WhatsApp、Email、SMS 等渠道，用户点击链接跳转到独立页面评分。
+
+#### 2.3 外链页面组件
+
+**页面视图**：`app/javascript/survey/views/Response.vue:1-204`
+
+```javascript
+// 从 URL 获取 survey ID（conversation UUID）
+computed: {
+  surveyId() {
+    const pageURL = window.location.href;
+    return pageURL.substring(pageURL.lastIndexOf('/') + 1);
+  },
+},
+
+// 挂载时获取调查详情
+async mounted() {
+  this.getSurveyDetails();
+},
+
+methods: {
+  async getSurveyDetails() {
+    this.isLoading = true;
+    try {
+      const result = await getSurveyDetails({ uuid: this.surveyId });
+      this.logo = result.data.inbox_avatar_url;
+      this.inboxName = result.data.inbox_name;
+      this.surveyDetails = result?.data?.csat_survey_response;
+      this.selectedRating = this.surveyDetails?.rating;
+      this.feedbackMessage = this.surveyDetails?.feedback_message || '';
+      this.displayType = result.data.display_type || CSAT_DISPLAY_TYPES.EMOJI;
+      this.setLocale(result.data.locale);
+    } catch (error) {
+      const errorMessage = error?.response?.data?.message;
+      this.errorMessage = errorMessage || this.$t('SURVEY.API.ERROR_MESSAGE');
+    } finally {
+      this.isLoading = false;
+    }
+  },
+
+  async updateSurveyDetails() {
+    this.isUpdating = true;
+    try {
+      const data = {
+        message: {
+          submitted_values: {
+            csat_survey_response: {
+              rating: this.selectedRating,
+              feedback_message: this.feedbackMessage,
+            },
+          },
+        },
+      };
+      await updateSurvey({
+        uuid: this.surveyId,
+        data,
+      });
+      this.surveyDetails = {
+        rating: this.selectedRating,
+        feedback_message: this.feedbackMessage,
+      };
+    } catch (error) {
+      const errorMessage = error?.response?.data?.error;
+      this.errorMessage = errorMessage || this.$t('SURVEY.API.ERROR_MESSAGE');
+      useAlert(this.errorMessage);
+    } finally {
+      this.isUpdating = false;
+    }
+  },
+}
+```
+
+**页面组件特性**：
+- 独立的 SPA 页面，通过 `survey/responses/:id` 路由访问
+- 从 URL 提取 `conversation_uuid`
+- 支持本地化（locale）
+- 显示品牌 Logo 和 Inbox 名称
+- 支持 emoji 和 star 两种评分方式
+
+---
+
+## 三、跨域回调与数据提交（两条路径对比）
 
 ### 3.1 CORS 配置
 
@@ -225,6 +448,14 @@ Rails.application.config.middleware.insert_before 0, Rack::Cors do
     origins '*'
     # 允许所有公共 API 端点的跨域访问
     resource '/public/api/*', headers: :any, methods: :any
+
+    if ActiveModel::Type::Boolean.new.cast(ENV.fetch('CW_API_ONLY_SERVER', false)) || Rails.env.development?
+      resource '*', headers: :any, methods: :any, expose: %w[access-token client uid expiry]
+    end
+
+    if ActiveModel::Type::Boolean.new.cast(ENV.fetch('ENABLE_API_CORS', false))
+      resource '/api/*', headers: :any, methods: :any, expose: %w[access-token client uid expiry]
+    end
   end
 end
 ```
@@ -248,9 +479,26 @@ end
 
 ---
 
-## 四、评价数据写回系统
+## 四、评价数据写回系统（两条回写路径详细对比）
 
-### 4.1 前端 API 调用
+### 4.0 两条路径总览对比
+
+| 维度 | 路径 A：Web Widget 会话内评分 | 路径 B：外链独立评分页 |
+|------|-----------------------------|---------------------|
+| **适用渠道** | Web Widget | WhatsApp、Email、SMS 等 |
+| **前端入口** | `CustomerSatisfaction.vue`（共享组件） | `Response.vue`（独立页面） |
+| **身份识别** | Message ID（数据库自增 ID） | Conversation UUID |
+| **API 端点** | `/api/v1/widget/messages/:id` | `/public/api/v1/csat_survey/:uuid` |
+| **HTTP 方法** | PATCH | PUT |
+| **控制器** | `Public::Api::V1::Inboxes::MessagesController` | `Public::Api::V1::CsatSurveyController` |
+| **参数结构** | `submitted_values: {...}` | `message: { submitted_values: {...} }` |
+| **后续流程** | 相同（事件驱动 → ResponseBuilder） | 相同（事件驱动 → ResponseBuilder） |
+
+---
+
+### 路径 A：Web Widget 会话内评分回写
+
+#### 4.1.1 前端 Store Action
 
 **Store Action**：`app/javascript/widget/store/modules/message.js:13-44`
 
@@ -290,6 +538,8 @@ export const actions = {
 };
 ```
 
+#### 4.1.2 Widget API 客户端
+
 **API 客户端**：`app/javascript/widget/api/message.js:1-12`
 
 ```javascript
@@ -307,9 +557,116 @@ export default {
 };
 ```
 
+**端点定义**：`app/javascript/widget/api/endPoints.js:86-88`
+
+```javascript
+const updateMessage = id => ({
+  url: `/api/v1/widget/messages/${id}${window.location.search}`,
+});
+```
+
+#### 4.1.3 后端控制器处理
+
+**Messages 控制器**：`app/controllers/public/api/v1/inboxes/messages_controller.rb:1-73`
+
+```ruby
+class Public::Api::V1::Inboxes::MessagesController < Public::Api::V1::InboxesController
+  before_action :set_message, only: [:update]
+
+  def update
+    # 14 天后锁定，无法修改
+    render json: { error: 'You cannot update the CSAT survey after 14 days' }, status: :unprocessable_entity and return if check_csat_locked
+
+    @message.update!(message_update_params)
+  rescue StandardError => e
+    render json: { error: @contact.errors, message: e.message }.to_json, status: :internal_server_error
+  end
+
+  private
+
+  def message_update_params
+    params.permit(submitted_values: [:name, :title, :value, { csat_survey_response: [:feedback_message, :rating] }])
+  end
+
+  def set_message
+    @message = @conversation.messages.find(params[:id])  # 通过 Message ID 查找
+  end
+
+  def check_csat_locked
+    (Time.zone.now.to_date - @message.created_at.to_date).to_i > 14 and @message.content_type == 'input_csat'
+  end
+end
+```
+
+**路由配置**：`config/routes.rb:557`
+
+```ruby
+resources :messages, only: [:index, :create, :update]  # PATCH /api/v1/widget/messages/:id
+```
+
+**请求示例**：
+```bash
+PATCH /api/v1/widget/messages/123?website_token=xxx
+Content-Type: application/json
+
+{
+  "contact": { "email": "user@example.com" },
+  "message": {
+    "submitted_values": {
+      "csat_survey_response": {
+        "rating": 5,
+        "feedback_message": "服务很好！"
+      }
+    }
+  }
+}
+```
+
 ---
 
-### 4.2 后端控制器处理
+### 路径 B：外链独立评分页回写
+
+#### 4.2.1 外链 API 客户端
+
+**Survey API**：`app/javascript/survey/api/survey.js:1-15`
+
+```javascript
+import endPoints from 'survey/api/endPoints';
+import { API } from 'survey/helpers/axios';
+
+const getSurveyDetails = async ({ uuid }) => {
+  const urlData = endPoints.getSurvey({ uuid });
+  const result = await API.get(urlData.url, { params: urlData.params });
+  return result;
+};
+
+const updateSurvey = async ({ uuid, data }) => {
+  const urlData = endPoints.updateSurvey({ data, uuid });
+  await API.put(urlData.url, { ...urlData.data });  // 使用 PUT 方法
+};
+
+export { getSurveyDetails, updateSurvey };
+```
+
+**端点定义**：`app/javascript/survey/api/endPoints.js:1-13`
+
+```javascript
+const updateSurvey = ({ uuid, data }) => ({
+  url: `/public/api/v1/csat_survey/${uuid}`,
+  data,
+});
+
+const getSurvey = ({ uuid }) => ({
+  url: `/public/api/v1/csat_survey/${uuid}`,
+});
+
+export default {
+  getSurvey,
+  updateSurvey,
+};
+```
+
+#### 4.2.2 后端控制器处理
 
 **CSAT 控制器**：`app/controllers/public/api/v1/csat_survey_controller.rb:1-32`
 
@@ -351,39 +708,66 @@ end
 **路由配置**：`config/routes.rb:563`
 
 ```ruby
-resources :csat_survey, only: [:show, :update]
+resources :csat_survey, only: [:show, :update]  # PUT /public/api/v1/csat_survey/:id
 ```
 
-**路由生成**：
-- `GET /public/api/v1/csat_survey/:id` → 获取 CSAT 调查信息
-- `PATCH /public/api/v1/csat_survey/:id` → 提交 CSAT 评价
+**请求示例**：
+```bash
+PUT /public/api/v1/csat_survey/abc123-def456-uuid
+Content-Type: application/json
 
-**参数说明**：
-- `:id`：对话的 UUID（不是数据库 ID）
-- 提交数据格式：
-  ```json
-  {
-    "message": {
-      "submitted_values": {
-        "csat_survey_response": {
-          "rating": 5,
-          "feedback_message": "服务非常好！"
-        }
+{
+  "message": {
+    "submitted_values": {
+      "csat_survey_response": {
+        "rating": 5,
+        "feedback_message": "客服服务非常专业！"
       }
     }
   }
-  ```
+}
+```
 
 ---
 
-### 4.3 CSAT 响应记录创建
+### 4.3 公共流程：消息更新事件触发（两条路径汇合点）
 
-**消息更新事件监听**：`app/listeners/csat_survey_listener.rb:10-15`
+无论使用哪条路径，当 Message 更新后都会触发相同的事件流程。
+
+#### 4.3.1 Message 模型回调
+
+**Message 模型**：`app/models/message.rb:137-140, 389-395, 246-249`
+
+```ruby
+after_update_commit :dispatch_update_event  # 更新后提交触发
+
+def dispatch_update_event
+  # ref: https://github.com/rails/rails/issues/44500
+  # we want to skip the update event if the message is not updated
+  return if previous_changes.blank?
+
+  send_update_event
+end
+
+def send_update_event
+  Rails.configuration.dispatcher.dispatch(
+    MESSAGE_UPDATED,
+    Time.zone.now,
+    message: self,
+    performed_by: Current.executed_by,
+    previous_changes: previous_changes
+  )
+end
+```
+
+#### 4.3.2 事件监听与处理
+
+**事件监听器**：`app/listeners/csat_survey_listener.rb:10-15`
 
 ```ruby
 def message_updated(event)
   message = extract_message_and_account(event)[0]
-  return unless message.input_csat?
+  return unless message.input_csat?  # 只处理 CSAT 消息
   CsatSurveys::ResponseBuilder.new(message: message).perform
 end
 ```
@@ -471,6 +855,8 @@ end
 
 ## 五、完整流程时序图
 
+### 5.1 总览时序图
+
 ```
 ┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
 │ 对话状态变更 │────▶│CsatSurvey    │────▶│CsatSurvey    │────▶│ 创建 CSAT    │────▶│ 消息存储        │
@@ -478,74 +864,236 @@ end
 └─────────────┘     └──────────────┘     └──────────────┘     └──────────────┘     └──────────────────┘
                                                                       │
                                                                       ▼
-                                                           ┌──────────────────┐
-                                                           │ 推送至前端组件   │
-                                                           │ (CustomerSatis- │
-                                                           │ faction.vue)    │
-                                                           └────────┬─────────┘
-                                                                    │
-                                                                    ▼
-┌──────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ 前端更新 Store   │◀────│ 用户提交评价  │◀────│ 用户选择评分  │◀────│ 用户选择评分  │
-│ (message/update) │     │ (点击提交)   │     │ (emoji/star) │     │ (emoji/star) │
-└────────┬─────────┘     └──────────────┘     └──────────────┘     └──────────────┘
-         │
-         ▼
-┌──────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
-│ Axios PATCH      │────▶│ /public/api/ │────▶│CsatSurvey    │────▶│ 更新 Message │
-│ 请求 (CORS)      │     │ v1/csat_     │     │Controller    │     │ content_     │
-│                  │     │ survey/:id   │     │#update       │     │ attributes   │
-└──────────────────┘     └──────────────┘     └──────────────┘     └──────┬───────┘
-                                                                           │
-                                                                           ▼
-┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
-│ CsatSurveyResp-  │◀────│CsatSurveys:: │◀────│ 触发消息更新  │
-│ onse 数据持久化   │     │Response      │     │ 事件        │
-│ (csat_survey_    │     │Builder       │     │ (message_    │
-│ responses表)     │     │              │     │ updated)     │
-└──────────────────┘     └──────────────┘     └──────────────┘
+                                                           ┌─────────────────────────┐
+                                                           │ 判断渠道类型             │
+                                                           │ 是 Web Widget?          │
+                                                           └───────────┬─────────────┘
+                                                                       │
+                        ┌──────────────────────────────────────────────┼──────────────────────────────────────────────┐
+                        │                                              │                                              │
+                        ▼                                              ▼                                              ▼
+              ┌─────────────────┐                        ┌─────────────────────────┐                    ┌─────────────────────────┐
+              │ Web Widget 渠道 │                        │ WhatsApp/Email/SMS 渠道 │                    │ 邮件通知               │
+              └────────┬────────┘                        └───────────┬─────────────┘                    └──────────┬──────────────┘
+                       │                                              │                                              │
+                       ▼                                              ▼                                              ▼
+              ┌─────────────────┐                        ┌─────────────────────────┐                    ┌─────────────────────────┐
+              │ 直接嵌入组件    │                        │ 生成外链 URL            │                    │ 邮件模板渲染           │
+              │ CustomerSatis- │                        │ /survey/responses/:uuid │                    │ csat_survey_link        │
+              │ faction.vue    │                        │ 附加到消息内容          │                    │                         │
+              └────────┬────────┘                        └───────────┬─────────────┘                    └──────────┬──────────────┘
+                       │                                              │                                              │
+                       ▼                                              ▼                                              ▼
+              ┌─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┐
+              │                        用户评分提交（两条路径分叉）                                                        │
+              └─────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### 5.2 路径 A：Web Widget 会话内评分时序图
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ 用户选择评分    │────▶│CustomerSatis-    │────▶│Vuex Store:       │────▶│Axios PATCH       │────▶│/api/v1/widget/   │
+│ (emoji/star)   │     │faction.vue       │     │message/update     │     │请求              │     │messages/:id      │
+└─────────────────┘     └────────┬─────────┘     └────────┬─────────┘     └──────────────────┘     └────────┬─────────┘
+                                 │                        │                                                 │
+                                 │                        │                                                 ▼
+                                 │                        │                                     ┌─────────────────────────┐
+                                 │                        │                                     │MessagesController#update │
+                                 │                        │                                     │@message.update!          │
+                                 │                        │                                     └───────────┬─────────────┘
+                                 │                        │                                                 │
+                                 │                        │                                                 ▼
+                                 │                        │                                     ┌─────────────────────────┐
+                                 │                        │                                     │after_update_commit       │
+                                 │                        │                                     │dispatch_update_event    │
+                                 │                        │                                     └───────────┬─────────────┘
+                                 │                        │                                                 │
+                                 │                        │                                                 ▼
+                                 │                        │                                     ┌─────────────────────────┐
+                                 │                        │                                     │MESSAGE_UPDATED 事件    │
+                                 │                        │                                     │CsatSurveyListener        │
+                                 │                        │                                     └───────────┬─────────────┘
+                                 │                        │                                                 │
+                                 │                        │                                                 ▼
+                                 │                        │                                     ┌─────────────────────────┐
+                                 │                        └────────────────────────────────────▶│ResponseBuilder#perform  │
+                                 │                                                              │CsatSurveyResponse.save!  │
+                                 │                                                              └───────────┬─────────────┘
+                                 │                                                                          │
+                                 │                                                                          ▼
+                                 │                                                              ┌─────────────────────────┐
+                                 └─────────────────────────────────────────────────────────────▶│ 数据持久化               │
+                                                                │ csat_survey_responses 表  │
+                                                                └─────────────────────────┘
+```
+
+### 5.3 路径 B：外链独立评分页时序图
+
+```
+┌─────────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐     ┌──────────────────┐
+│ 用户点击链接    │────▶│GET /survey/      │────▶│Response.vue      │────▶│GET /public/api/  │────▶│CsatSurvey        │
+│ (WhatsApp/Email)│     │responses/:uuid  │     │mounted()         │     │v1/csat_survey/   │     │Controller#show   │
+└─────────────────┘     └──────────────────┘     └────────┬─────────┘     │:uuid             │     └────────┬─────────┘
+                                                          │               └──────────────────┘              │
+                                                          │                                               ▼
+                                                          │                                    ┌─────────────────────────┐
+                                                          │                                    │ 返回调查详情            │
+                                                          │                                    │ inbox_avatar_url        │
+                                                          │                                    │ inbox_name              │
+                                                          │                                    │ display_type            │
+                                                          │                                    │ csat_survey_response    │
+                                                          │                                    └───────────┬─────────────┘
+                                                          │                                                │
+                                                          ▼                                                │
+                                               ┌─────────────────────────┐                                  │
+                                               │ 渲染评分页面             │                                  │
+                                               │ Rating / Feedback 组件  │                                  │
+                                               └───────────┬─────────────┘                                  │
+                                                           │                                                │
+                                                           ▼                                                │
+                                               ┌─────────────────────────┐                                  │
+                                               │ 用户选择评分/提交反馈    │                                  │
+                                               └───────────┬─────────────┘                                  │
+                                                           │                                                │
+                                                           ▼                                                │
+                                               ┌─────────────────────────┐                                  │
+                                               │Response.vue             │                                  │
+                                               │updateSurveyDetails()    │                                  │
+                                               └───────────┬─────────────┘                                  │
+                                                           │                                                │
+                                                           ▼                                                │
+                                               ┌─────────────────────────┐                                  │
+                                               │Axios PUT 请求           │                                  │
+                                               │/public/api/v1/          │                                  │
+                                               │csat_survey/:uuid        │                                  │
+                                               └───────────┬─────────────┘                                  │
+                                                           │                                                │
+                                                           ▼                                                │
+                                               ┌─────────────────────────┐                                  │
+                                               │CsatSurveyController     │◀─────────────────────────────────┘
+                                               │#update                  │
+                                               │@message.update!        │
+                                               └───────────┬─────────────┘
+                                                           │
+                                                           ▼
+                                               ┌─────────────────────────┐
+                                               │after_update_commit       │
+                                               │dispatch_update_event    │
+                                               └───────────┬─────────────┘
+                                                           │
+                                                           ▼
+                                               ┌─────────────────────────┐
+                                               │MESSAGE_UPDATED 事件    │
+                                               │CsatSurveyListener        │
+                                               └───────────┬─────────────┘
+                                                           │
+                                                           ▼
+                                               ┌─────────────────────────┐
+                                               │ResponseBuilder#perform  │
+                                               │CsatSurveyResponse.save!  │
+                                               └───────────┬─────────────┘
+                                                           │
+                                                           ▼
+                                               ┌─────────────────────────┐
+                                               │ 数据持久化               │
+                                               │ csat_survey_responses 表  │
+                                               └─────────────────────────┘
 ```
 
 ---
 
 ## 六、关键技术点总结
 
-### 6.1 安全性设计
+### 6.1 两条回写路径详细对比
+
+| 对比项 | 路径 A：Web Widget 会话内 | 路径 B：外链独立评分页 |
+|--------|------------------------|---------------------|
+| **适用渠道** | Web Widget 网站插件 | WhatsApp、Email、SMS、API 渠道 |
+| **前端组件** | `shared/components/CustomerSatisfaction.vue` | `survey/views/Response.vue` |
+| **页面路由** | 无（嵌入 Widget） | `GET /survey/responses/:id` |
+| **身份识别** | Message 数据库 ID（`params[:id]`） | Conversation UUID（`params[:id]`） |
+| **API 端点** | `/api/v1/widget/messages/:id` | `/public/api/v1/csat_survey/:uuid` |
+| **HTTP 方法** | **PATCH** | **PUT** |
+| **控制器** | `Public::Api::V1::Inboxes::MessagesController` | `Public::Api::V1::CsatSurveyController` |
+| **请求参数包装** | `message: { submitted_values: {...} }` | `message: { submitted_values: {...} }` |
+| **参数结构差异** | 外层有 `contact: { email }` | 无 contact 参数 |
+| **前置中间件** | `set_inbox_channel`, `set_contact_inbox`, `set_conversation` | `set_conversation`, `set_message` |
+| **查找逻辑** | `@conversation.messages.find(params[:id])` | `Conversation.find_by!(uuid: params[:id])` |
+| **14天锁检查** | `check_csat_locked` (需同时满足 content_type == input_csat) | `check_csat_locked` |
+| **更新方式** | `@message.update!(message_update_params)` | `@message.update!(message_update_params[:message])` |
+| **事件触发** | `after_update_commit :dispatch_update_event` | 相同 |
+| **事件处理** | `CsatSurveyListener#message_updated` | 相同 |
+| **数据落库** | `CsatSurveys::ResponseBuilder` | 相同 |
+
+### 6.2 URL 完整生成链路
+
+```
+对话状态变更为 resolved
+    ↓
+CsatSurveyListener#conversation_status_changed
+    ↓
+CsatSurveyService#perform
+    ↓
+MessageTemplates::Template::CsatSurvey#perform
+    ↓
+创建 Message (content_type: :input_csat)
+    ↓
+根据渠道类型决定是否附加外链:
+  ├── Web Widget 渠道: 不附加外链，前端直接渲染组件
+  └── 其他渠道: MessageContentPresenter#content_with_survey_link
+                    ↓
+              survey_url(conversation.uuid)
+                    ↓
+              "#{FRONTEND_URL}/survey/responses/#{uuid}"
+                    ↓
+              例如: https://app.chatwoot.com/survey/responses/abc123-def456
+```
+
+### 6.3 安全性设计
 
 | 机制 | 实现位置 | 说明 |
 |------|---------|------|
 | 跨域支持 | `config/initializers/cors.rb` | `/public/api/*` 允许所有源 |
 | CSRF 跳过 | `app/controllers/public_controller.rb` | 公共接口不验证 CSRF Token |
-| 身份识别 | `Conversation.find_by!(uuid: params[:id])` | 使用 UUID 而非自增 ID |
+| 身份识别 - 外链 | `Conversation.find_by!(uuid: params[:id])` | 使用 UUID 而非自增 ID |
+| 身份识别 - Widget | `@conversation.messages.find(params[:id])` | 依赖会话上下文 |
 | 时间锁 | `check_csat_locked` | 14 天后无法修改评价 |
+| 强参数 | `message_update_params` | 仅允许白名单字段 |
 
-### 6.2 数据流转
+### 6.4 事件落库完整流程
 
 ```
-用户选择评分
+用户提交评价
     ↓
-CustomerSatisfaction.vue (onSubmit)
+API 控制器处理
     ↓
-Vuex Store: message/update
+Message.update!(content_attributes)  # 更新 messages 表
     ↓
-Axios: PATCH /public/api/v1/csat_survey/:id
+ActiveRecord 回调触发: after_update_commit
     ↓
-CsatSurveyController#update
+Message#dispatch_update_event
     ↓
-Message.update!(content_attributes)
+Message#send_update_event
     ↓
-消息更新事件触发
+Rails.configuration.dispatcher.dispatch(MESSAGE_UPDATED, ...)
     ↓
-CsatSurveyListener#message_updated
+AsyncDispatcher 分发到所有已注册 listeners
+    ↓
+CsatSurveyListener#message_updated(event)
+    ↓
+检查 message.input_csat?
     ↓
 CsatSurveys::ResponseBuilder#perform
+    ↓
+从 message.content_attributes 提取 rating 和 feedback_message
     ↓
 CsatSurveyResponse.create / update
     ↓
 数据持久化到 csat_survey_responses 表
 ```
 
-### 6.3 核心文件索引
+### 6.5 核心文件索引
 
 | 功能 | 文件路径 |
 |------|---------|
@@ -553,21 +1101,64 @@ CsatSurveyResponse.create / update
 | CSAT 消息模板 | `app/services/message_templates/template/csat_survey.rb` |
 | CSAT 事件监听 | `app/listeners/csat_survey_listener.rb` |
 | CSAT 响应构建 | `app/builders/csat_surveys/response_builder.rb` |
-| CSAT 控制器 | `app/controllers/public/api/v1/csat_survey_controller.rb` |
+| CSAT 控制器（外链） | `app/controllers/public/api/v1/csat_survey_controller.rb` |
+| Messages 控制器（Widget） | `app/controllers/public/api/v1/inboxes/messages_controller.rb` |
+| 外链评分页控制器 | `app/controllers/survey/responses_controller.rb` |
 | CSAT 数据模型 | `app/models/csat_survey_response.rb` |
-| CSAT 前端组件 | `app/javascript/shared/components/CustomerSatisfaction.vue` |
+| 消息内容 Presenter（URL 生成） | `app/presenters/message_content_presenter.rb` |
+| 外链页面组件 | `app/javascript/survey/views/Response.vue` |
+| 共享评分组件 | `app/javascript/shared/components/CustomerSatisfaction.vue` |
+| Widget API 客户端 | `app/javascript/widget/api/message.js` |
+| 外链 API 客户端 | `app/javascript/survey/api/survey.js` |
 | CORS 配置 | `config/initializers/cors.rb` |
 | 公共控制器基类 | `app/controllers/public_controller.rb` |
+| 事件分发器 | `app/dispatchers/async_dispatcher.rb` |
 
 ---
 
 ## 七、API 示例
 
-### 7.1 提交 CSAT 评价
+### 7.1 路径 A：Web Widget 会话内提交 CSAT 评价
 
 **请求**：
 ```bash
-PATCH /public/api/v1/csat_survey/{conversation_uuid}
+PATCH /api/v1/widget/messages/123?website_token=abc-def-123
+Content-Type: application/json
+
+{
+  "contact": {
+    "email": "user@example.com"
+  },
+  "message": {
+    "submitted_values": {
+      "csat_survey_response": {
+        "rating": 5,
+        "feedback_message": "客服服务非常专业，问题解决得很快！"
+      }
+    }
+  }
+}
+```
+
+**成功响应**（200 OK）：
+```json
+{}
+```
+
+**失败响应**（422 Unprocessable Entity）：
+```json
+{
+  "error": "You cannot update the CSAT survey after 14 days"
+}
+```
+
+---
+
+### 7.2 路径 B：外链独立评分页提交 CSAT 评价
+
+**请求**：
+```bash
+PUT /public/api/v1/csat_survey/{conversation_uuid}
 Content-Type: application/json
 
 {
@@ -594,7 +1185,9 @@ Content-Type: application/json
 }
 ```
 
-### 7.2 获取 CSAT 调查信息
+---
+
+### 7.3 获取 CSAT 调查信息（外链页面使用）
 
 **请求**：
 ```bash
@@ -603,3 +1196,84 @@ GET /public/api/v1/csat_survey/{conversation_uuid}
 
 **响应**（通过 JBuilder 序列化）：
 - 参考 `app/views/public/api/v1/models/_csat_survey.json.jbuilder`
+
+返回数据结构：
+```json
+{
+  "inbox_avatar_url": "https://...",
+  "inbox_name": "Support Inbox",
+  "display_type": "emoji",
+  "content": "Please rate this conversation",
+  "locale": "en",
+  "csat_survey_response": {
+    "rating": null,
+    "feedback_message": null
+  }
+}
+```
+
+---
+
+## 八、数据流转总览
+
+### 8.1 会话内评分数据流
+
+```
+用户选择评分
+    ↓
+CustomerSatisfaction.vue (onSubmit)
+    ↓
+Vuex Store: message/update
+    ↓
+Axios: PATCH /api/v1/widget/messages/:id
+    ↓
+Public::Api::V1::Inboxes::MessagesController#update
+    ↓
+Message.update!(content_attributes)
+    ↓
+after_update_commit → dispatch_update_event
+    ↓
+MESSAGE_UPDATED 事件
+    ↓
+CsatSurveyListener#message_updated
+    ↓
+CsatSurveys::ResponseBuilder#perform
+    ↓
+CsatSurveyResponse.create / update
+    ↓
+数据持久化到 csat_survey_responses 表
+```
+
+### 8.2 外链评分数据流
+
+```
+用户点击链接: /survey/responses/:uuid
+    ↓
+Response.vue 加载
+    ↓
+Axios: GET /public/api/v1/csat_survey/:uuid
+    ↓
+获取调查详情
+    ↓
+用户选择评分
+    ↓
+Response.vue (updateSurveyDetails)
+    ↓
+Axios: PUT /public/api/v1/csat_survey/:uuid
+    ↓
+Public::Api::V1::CsatSurveyController#update
+    ↓
+Message.update!(content_attributes)
+    ↓
+after_update_commit → dispatch_update_event
+    ↓
+MESSAGE_UPDATED 事件
+    ↓
+CsatSurveyListener#message_updated
+    ↓
+CsatSurveys::ResponseBuilder#perform
+    ↓
+CsatSurveyResponse.create / update
+    ↓
+数据持久化到 csat_survey_responses 表
+```
