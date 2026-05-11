@@ -207,7 +207,252 @@ end
 - `true`（默认）：会话可以自动分配给团队成员
 - `false`：跳过该会话，不进行自动分配
 
-### 3.3 过滤条件叠加
+### 3.3 团队切换时 Assignee 失效、清空与重新分配的完整链路
+
+#### 3.3.1 Conversation 模型中的两个独立 Handler
+
+Conversation 模型同时 include 了两个 concern，它们在**不同生命周期阶段**处理团队切换：
+
+```ruby
+# app/models/conversation.rb:57-58
+include AssignmentHandler      # ← 处理团队切换的 assignee 校验 + 同步重新分配
+include AutoAssignmentHandler  # ← 处理状态变更触发的自动分配
+```
+
+| Handler | 触发时机 | 触发条件 | 主要职责 |
+|---------|---------|---------|---------|
+| `AssignmentHandler` | `before_save` | `team_id_changed?` | 校验 assignee 是否属于新团队 + 尝试同步重新分配 |
+| `AutoAssignmentHandler` | `after_save` | 状态变更（open/resolved/snoozed） | 触发 V1 同步分配或 V2 异步 Job |
+
+**关键点**：`team_id_changed?` 本身**不会**触发 `AutoAssignmentHandler`，只有状态变更才会触发。
+
+---
+
+#### 3.3.2 AssignmentHandler：团队切换的完整链路
+
+**核心文件**：`app/models/concerns/assignment_handler.rb`
+
+```ruby
+included do
+  before_save :ensure_assignee_is_from_team
+  after_commit :notify_assignment_change, :process_assignment_changes
+end
+
+def ensure_assignee_is_from_team
+  return unless team_id_changed?  # ← 仅当 team_id 变化时执行
+
+  validate_current_assignee_team
+  self.assignee ||= find_assignee_from_team
+end
+```
+
+**完整执行流程（保存前）**：
+
+```
+conversation.team = new_team (或 conversation.update!(team: new_team))
+    ↓
+before_save 回调触发
+    ↓
+ensure_assignee_is_from_team
+    ├── 1. validate_current_assignee_team（清空失效 assignee）
+    └── 2. find_assignee_from_team（尝试从新团队重新分配）
+    ↓
+save（保存到数据库）
+    ↓
+after_commit
+    ├── notify_assignment_change（派发 TEAM_CHANGED / ASSIGNEE_CHANGED 事件）
+    └── process_assignment_changes（创建活动记录）
+```
+
+##### 3.3.2.1 第一步：Assignee 失效与清空
+
+```ruby
+# app/models/concerns/assignment_handler.rb:19-21
+def validate_current_assignee_team
+  self.assignee_id = nil if team&.members&.exclude?(assignee)
+end
+```
+
+**清空条件**：`team&.members&.exclude?(assignee)`
+
+| 切换场景 | 旧 assignee 在新团队中？ | 结果 |
+|---------|------------------------|------|
+| 无团队 → 有团队 A | 取决于 assignee 是否在 A 中 | 不在 → 清空 |
+| 团队 A → 团队 B | 取决于 assignee 是否在 B 中 | 不在 → 清空 |
+| 有团队 → 无团队 | `team` 为 nil，条件不触发 | **保留原 assignee** |
+| 团队内成员间切换（不切换 team） | `team_id_changed?` 为 false | 不进入此逻辑 |
+
+**注意**：从有团队切换到无团队时，`team` 变为 `nil`，`team&.members` 返回 `nil`，`nil&.exclude?(assignee)` 返回 `nil`（falsy），因此条件不满足，**不会清空 assignee**。
+
+##### 3.3.2.2 第二步：重新分配尝试
+
+如果上一步清空了 assignee（`self.assignee` 变为 `nil`），则尝试从新团队中自动分配：
+
+```ruby
+# app/models/concerns/assignment_handler.rb:23-28
+def find_assignee_from_team
+  return if team&.allow_auto_assign.blank?  # ← 团队禁用自动分配则跳过
+
+  team_members_with_capacity = inbox.member_ids_with_assignment_capacity & team.members.ids
+  ::AutoAssignment::AgentAssignmentService.new(conversation: self, allowed_agent_ids: team_members_with_capacity).find_assignee
+end
+```
+
+**分配逻辑**：
+1. 检查新团队的 `allow_auto_assign` 是否为 `true`
+2. 计算候选 agent 集合：`inbox.member_ids_with_assignment_capacity` ∩ `team.members.ids`
+3. 调用 `AgentAssignmentService#find_assignee`（**V1 逻辑，仅轮询**）
+
+**AgentAssignmentService 的选择逻辑**：
+
+```ruby
+# app/services/auto_assignment/agent_assignment_service.rb:7-9
+def find_assignee
+  round_robin_manage_service.available_agent(allowed_agent_ids: allowed_online_agent_ids)
+end
+
+# 过滤出在线 agent
+def allowed_online_agent_ids
+  @allowed_online_agent_ids ||= online_agent_ids & allowed_agent_ids&.map(&:to_s)
+end
+```
+
+**关键注意**：
+- 此处使用的是 **V1 的 `AgentAssignmentService`**（Redis 轮询）
+- 不经过 V2 的 `AssignmentService`
+- 不应用 `RateLimiter`（fair_distribution_limit/window）
+- 不应用 `CapacityService`（agent 容量限制）
+- 不支持 Balanced 策略
+
+---
+
+#### 3.3.3 V1 与 V2 的触发条件与处理路径差异
+
+##### 触发条件对比
+
+**判断 V1/V2 的唯一标准**：
+
+```ruby
+# app/models/concerns/auto_assignment_handler.rb:17
+if inbox.auto_assignment_v2_enabled?
+  # V2 路径
+else
+  # V1 路径
+end
+
+# app/models/inbox.rb:206-208
+def auto_assignment_v2_enabled?
+  account.feature_enabled?('assignment_v2')
+end
+```
+
+**团队切换场景的完整路径差异**：
+
+| 阶段 | V1 路径（assignment_v2 未启用） | V2 路径（assignment_v2 已启用） |
+|------|------------------------------|------------------------------|
+| **before_save（团队切换）** | 同 V2：`AssignmentHandler` 清空 assignee + `find_assignee_from_team` 同步调用 `AgentAssignmentService` | 同 V1 |
+| **after_save（状态变更）** | `AutoAssignmentHandler` 同步调用 `AgentAssignmentService` | `AutoAssignmentHandler` 触发 `AssignmentJob.perform_later`（异步） |
+| **策略选择** | 始终轮询（Redis 队列） | before_save：轮询；异步 Job：根据策略选择轮询或 Balanced |
+| **RateLimiter** | 不应用 | 异步 Job 中应用 |
+| **CapacityService** | 不应用 | 异步 Job 中应用（企业版） |
+
+##### 团队切换时的 V1 完整流程图
+
+```
+conversation.update!(team: new_team)
+    ↓
+before_save: AssignmentHandler
+    ├── validate_current_assignee_team
+    │    └── assignee 不在新团队中 → assignee_id = nil
+    └── find_assignee_from_team
+         ├── team.allow_auto_assign?
+         ├── 计算交集: inbox.member_ids_with_assignment_capacity ∩ team.members.ids
+         └── AgentAssignmentService#find_assignee（同步，仅轮询）
+    ↓
+save
+    ↓
+after_commit: AssignmentHandler
+    ├── TEAM_CHANGED 事件（如果 team_id 变化）
+    └── ASSIGNEE_CHANGED 事件（如果 assignee 变化）
+    ↓
+after_save: AutoAssignmentHandler（仅当状态变更时才触发）
+    ├── conversation_status_changed_to_open?
+    │    └── AgentAssignmentService#perform（同步）
+    └── 注意：纯 team_id 变更（无状态变更）不会触发此路径
+```
+
+##### 团队切换时的 V2 完整流程图
+
+```
+conversation.update!(team: new_team)
+    ↓
+before_save: AssignmentHandler（与 V1 完全相同）
+    ├── validate_current_assignee_team
+    │    └── assignee 不在新团队中 → assignee_id = nil
+    └── find_assignee_from_team
+         └── AgentAssignmentService#find_assignee（同步，仅轮询）
+    ↓
+save
+    ↓
+after_commit: AssignmentHandler（与 V1 完全相同）
+    ├── TEAM_CHANGED 事件
+    └── ASSIGNEE_CHANGED 事件（如发生）
+    ↓
+after_save: AutoAssignmentHandler（仅当状态变更时才触发）
+    ├── conversation_status_changed_to_open? || conversation_status_changed_to_resolved_or_snoozed?
+    │    └── AutoAssignment::AssignmentJob.perform_later（异步）
+    │         └── AssignmentService#perform_bulk_assignment
+    │              ├── filter_agents_by_team
+    │              ├── filter_agents_by_rate_limit（应用 fair_distribution）
+    │              ├── filter_agents_by_capacity（企业版）
+    │              └── 轮询 / Balanced 选择（根据策略）
+    └── 注意：纯 team_id 变更（无状态变更）不会触发此路径
+```
+
+##### V1 vs V2 关键差异总结表
+
+| 维度 | V1（assignment_v2 未启用） | V2（assignment_v2 已启用） |
+|------|--------------------------|--------------------------|
+| **团队切换的同步重新分配** | `AgentAssignmentService`（轮询） | 同 V1 |
+| **状态变更的后续分配** | 同步 `AgentAssignmentService` | 异步 `AssignmentJob` |
+| **支持的分配策略** | 仅轮询 | before_save：轮询；异步 Job：轮询或 Balanced |
+| **fair_distribution 限速** | 不应用 | 异步 Job 中应用 |
+| **Agent 容量限制** | 不应用 | 异步 Job 中应用（企业版） |
+| **触发频率** | 同步执行 | 同步 + 异步可能再次执行 |
+
+#### 3.3.4 特殊情况：Inbox 自动分配禁用时的团队分配
+
+**测试确认** (`spec/enterprise/models/conversation_spec.rb:83-111`)：
+
+```ruby
+it 'does not enforce max_assignment_limit for team assignment when inbox auto-assignment is disabled' do
+  conversation = create(:conversation, inbox: inbox, account: account, assignee: nil, status: :open)
+  conversation.update!(team: team)
+  expect(conversation.reload.assignee).to be_present
+end
+```
+
+**原因**：`find_assignee_from_team` 使用 `inbox.member_ids_with_assignment_capacity`，而在 `Enterprise::Inbox` 中：
+
+```ruby
+# enterprise/app/models/enterprise/inbox.rb:2-9
+def member_ids_with_assignment_capacity
+  return super unless enable_auto_assignment?  # ← 关键检查
+  return filter_by_capacity(available_agents).map(&:user_id) if auto_assignment_v2_enabled?
+
+  max_assignment_limit = auto_assignment_config['max_assignment_limit']
+  overloaded_agent_ids = max_assignment_limit.present? ? get_agent_ids_over_assignment_limit(max_assignment_limit) : []
+  super - overloaded_agent_ids
+end
+```
+
+当 `enable_auto_assignment?` 为 `false` 时，直接返回 `super`（所有成员 ID），**不应用任何容量限制**。
+
+这意味着：**即使 inbox 禁用了自动分配，团队切换时仍会尝试分配，且不考虑容量限制**。
+
+---
+
+### 3.4 过滤条件叠加
 
 跨团队分配时，会经过多层过滤：
 
@@ -284,16 +529,138 @@ end
 def window
   config&.fair_distribution_window&.to_i || 5.minutes.to_i
 end
-```
 
-**配置参数**（在 `AssignmentPolicy` 中）：
-- `fair_distribution_limit`：每个时间窗口内最多分配的会话数（默认 100）
-- `fair_distribution_window`：时间窗口秒数（默认 3600 = 1 小时）
+def config
+  @config ||= inbox.assignment_policy
+end
+```
 
 **工作原理**：
 1. 每次分配在 Redis 中记录一个带过期时间的 key
 2. 分配前检查该 agent 在当前时间窗口内的分配记录数
 3. 超过限制则跳过该 agent
+
+### 3.6 fair_distribution_limit/window 在有策略与无策略下的真实默认值链路
+
+#### 3.6.1 默认值来源的三层结构
+
+系统存在**三层默认值**，优先级从高到低：
+
+```
+用户显式配置值
+    ↓ (无)
+数据库 schema 默认值 (AssignmentPolicy 字段)
+    ↓ (无策略或字段为空)
+代码硬编码 fallback (RateLimiter)
+```
+
+#### 3.6.2 有策略时（Inbox 关联了 AssignmentPolicy）
+
+**数据库 Schema 默认值** (`db/schema.rb` + `app/models/assignment_policy.rb`)：
+
+```ruby
+# Schema:
+#  fair_distribution_limit  :integer          default(100), not null
+#  fair_distribution_window :integer          default(3600), not null
+```
+
+当创建 `AssignmentPolicy` 时，如果未显式指定，数据库会使用：
+
+| 参数 | Schema 默认值 | 说明 |
+|------|--------------|------|
+| `fair_distribution_limit` | 100 | 每小时最多 100 次分配 |
+| `fair_distribution_window` | 3600 | 窗口 = 3600 秒 = 1 小时 |
+
+**代码获取链路**：
+
+```ruby
+# RateLimiter
+def config
+  @config ||= inbox.assignment_policy  # ← 存在策略
+end
+
+def limit
+  # config&.fair_distribution_limit.present? → true（数据库有值）
+  # 使用 config.fair_distribution_limit.to_i → 100
+  config&.fair_distribution_limit.present? ? config.fair_distribution_limit.to_i : 5
+end
+
+def window
+  # config&.fair_distribution_window&.to_i → 3600
+  config&.fair_distribution_window&.to_i || 5.minutes.to_i  # 3600
+end
+```
+
+#### 3.6.3 无策略时（Inbox 未关联 AssignmentPolicy）
+
+当 `inbox.assignment_policy` 为 `nil` 时：
+
+```ruby
+# RateLimiter
+def config
+  @config ||= inbox.assignment_policy  # ← nil
+end
+
+def limit
+  # config&.fair_distribution_limit.present? → nil&. → nil → false
+  # 使用 fallback 值
+  config&.fair_distribution_limit.present? ? ... : 5  # ← 5
+end
+
+def window
+  # config&.fair_distribution_window&.to_i → nil
+  # 使用 fallback 值
+  config&.fair_distribution_window&.to_i || 5.minutes.to_i  # ← 300 秒
+end
+```
+
+**代码硬编码 fallback**：
+
+| 参数 | 代码 fallback | 说明 |
+|------|--------------|------|
+| `fair_distribution_limit` | 5 | 每 5 分钟最多 5 次分配 |
+| `fair_distribution_window` | 300 秒 (5 分钟) | 窗口 = 5 分钟 |
+
+#### 3.6.4 默认值对比表
+
+| 场景 | `fair_distribution_limit` | `fair_distribution_window` | 限制速率 |
+|------|--------------------------|---------------------------|---------|
+| **有策略（默认创建）** | 100 | 3600 秒 (1 小时) | ~1.67 次/分钟 |
+| **无策略** | 5 | 300 秒 (5 分钟) | ~1 次/分钟 |
+| **差异比例** | 20× | 12× | 约 1.67× |
+
+#### 3.6.5 注意事项
+
+1. **不要混淆两套默认值**：
+   - Schema 默认值是 `AssignmentPolicy` 记录创建时的数据库默认
+   - 代码 fallback 是 `RateLimiter` 在**无策略或策略缺失**时的兜底
+
+2. **两种限速机制并存**：
+   - **V1**：`inbox.auto_assignment_config['max_assignment_limit']`（企业版）
+     ```ruby
+     # enterprise/app/models/enterprise/inbox.rb:6-8
+     max_assignment_limit = auto_assignment_config['max_assignment_limit']
+     overloaded_agent_ids = max_assignment_limit.present? ? get_agent_ids_over_assignment_limit(max_assignment_limit) : []
+     ```
+   - **V2**：`fair_distribution_limit/window`（RateLimiter）
+
+   两者是**不同层次**的限速：
+   - `max_assignment_limit`：基于当前**已打开会话数**的硬限制
+   - `fair_distribution_limit/window`：基于**时间窗口内分配次数**的软限制
+
+3. **测试中的 mock**：
+
+在测试中经常直接 mock `auto_assignment_config` 返回特定值，绕过真实默认值链路：
+
+```ruby
+# spec/services/auto_assignment/assignment_service_spec.rb:193-196
+allow(inbox).to receive(:auto_assignment_config).and_return({
+  'fair_distribution_limit' => 2,
+  'fair_distribution_window' => 3600
+})
+```
+
+注意：实际生产代码中 `auto_assignment_config` 是 Inbox 的 JSONB 字段（用于 V1 的 `max_assignment_limit`），V2 的 `fair_distribution_*` 参数来自 `AssignmentPolicy` 模型。
 
 ---
 
