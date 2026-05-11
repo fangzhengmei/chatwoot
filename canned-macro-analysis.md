@@ -608,18 +608,13 @@ POST /api/v1/accounts/:account_id/macros/:id/execute
     └─ @macro.personal? 且 不是作者 ──→ 抛出 Pundit::NotAuthorizedError
               │
               ▼
-              ApplicationController 中的异常处理：
-              include Pundit::Authorization
-              include RequestExceptionHandler
-              │
-              ▼
-              RequestExceptionHandler 中：
-              rescue Pundit::NotAuthorizedError => e
-                log_handled_error(e)
-                render_unauthorized('You are not authorized to do this action')
-              ensure
-                Current.reset
-              end
+              继承链分析：
+              ApplicationController
+                └── around_action :handle_with_exception
+                      └── RequestExceptionHandler#handle_with_exception
+                            └── rescue Pundit::NotAuthorizedError
+                                  └── render_unauthorized(...)
+                                        └── status: :unauthorized
               │
               ▼
               HTTP 401 Unauthorized
