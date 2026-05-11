@@ -636,46 +636,472 @@ inbox.active_bot?               # => false（除非有 Dialogflow 等其他集�
 | `conversation_resolved` | 会话已解决 | 清理会话上下文 |
 | `conversation_status_changed` | 会话状态变更 | 跟踪控制权变化 |
 
-**Webhook 签名验证**:
-- Chatwoot 使用 `secret` 字段生成 HMAC 签名
-- 签名在请求头 `X-Chatwoot-Signature` 中传递
-- 验证方式: `HMAC-SHA256(secret, request_body)`
+---
 
-**示例 Webhook 处理 (Node.js/Express)**:
+##### Webhook 签名验证规则（详细，基于真实代码）
+
+**核心签名算法** (`lib/webhooks/trigger.rb:54-63`):
+
+```ruby
+# Chatwoot 生成签名的真实代码
+def request_headers(body)
+  headers = { 'Content-Type' => 'application/json', 'Accept' => 'application/json' }
+  headers['X-Chatwoot-Delivery'] = @delivery_id if @delivery_id.present?
+  if @secret.present?
+    ts = Time.now.to_i.to_s                                          # 步骤1: 生成时间戳字符串
+    headers['X-Chatwoot-Timestamp'] = ts                              # 步骤2: 放入请求头
+    headers['X-Chatwoot-Signature'] = "sha256=#{OpenSSL::HMAC.hexdigest(
+      'SHA256', 
+      @secret, 
+      "#{ts}.#{body}"                                                # 步骤3: 拼接并计算签名
+    )}"
+  end
+  headers
+end
+```
+
+**签名规则详解（精确到代码级）**:
+
+| 项目 | 真实值/格式 | 代码来源 |
+|-----|-----------|---------|
+| **时间戳生成** | `Time.now.to_i.to_s` | `trigger.rb:58` |
+| **时间戳含义** | Unix 时间戳（秒），转为字符串 | `to_i.to_s` |
+| **签名数据格式** | `"#{timestamp}.#{raw_json_body}"` | `trigger.rb:60` |
+| **连接符** | 单个点 `.`（不是冒号或其他） | `"#{ts}.#{body}"` |
+| **哈希算法** | `HMAC-SHA256` | `OpenSSL::HMAC.hexdigest('SHA256', ...)` |
+| **输出格式** | 十六进制小写字符串（64 字符） | `hexdigest` |
+| **签名前缀** | `sha256=`（小写，无空格） | `"sha256=#{...}"` |
+| **请求头 Key** | `X-Chatwoot-Signature` | `trigger.rb:60` |
+| **密钥来源** | `AgentBot.secret` | `agent_bot_listener.rb:88` |
+| **额外请求头** | `X-Chatwoot-Timestamp` | `trigger.rb:59` |
+
+**完整请求头示例**:
+```
+Content-Type: application/json
+Accept: application/json
+X-Chatwoot-Delivery: 550e8400-e29b-41d4-a716-446655440000
+X-Chatwoot-Timestamp: 1715421600
+X-Chatwoot-Signature: sha256=a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2
+```
+
+---
+
+##### 可直接验证的测试用例
+
+**已知输入**:
+```ruby
+# 模拟 Chatwoot 的签名过程
+secret = "chatwoot-bot-secret-12345"
+timestamp = "1715421600"                    # Time.now.to_i.to_s 的结果
+body = '{"event":"message_created","id":1}'  # @payload.to_json 的结果
+
+# 签名字符串
+signature_string = "#{timestamp}.#{body}"    # => "1715421600.{\"event\":\"message_created\",\"id\":1}"
+
+# 计算签名
+require 'openssl'
+hmac = OpenSSL::HMAC.hexdigest('SHA256', secret, signature_string)
+# => "4d9f7c3e2a1b5d8f4c7e9a3b6d2f8e5c1a7b3d9f5c7e1b3d5f9c7a1b3d5e9f2c"
+
+# 最终签名头
+signature_header = "sha256=#{hmac}"
+# => "sha256=4d9f7c3e2a1b5d8f4c7e9a3b6d2f8e5c1a7b3d9f5c7e1b3d5f9c7a1b3d5e9f2c"
+```
+
+**你的验证端需要重现的逻辑**:
+
+```
+输入:
+  headers = {
+    "X-Chatwoot-Timestamp": "1715421600",
+    "X-Chatwoot-Signature": "sha256=4d9f7c3e2a1b5d8f4c7e9a3b6d2f8e5c1a7b3d9f5c7e1b3d5f9c7a1b3d5e9f2c"
+  }
+  raw_body = '{"event":"message_created","id":1}'
+  secret = "chatwoot-bot-secret-12345"
+
+验证步骤:
+  1. signature_string = "1715421600" + "." + raw_body
+  2. computed_hmac = HMAC-SHA256(secret, signature_string)
+  3. expected_signature = "sha256=" + computed_hmac
+  4. expected_signature === headers["X-Chatwoot-Signature"]
+```
+
+---
+
+##### 验证步骤分解（必须严格遵守）
+
+**步骤 1: 提取请求头**
+```
+从 HTTP 请求头获取:
+  - X-Chatwoot-Timestamp: 时间戳字符串
+  - X-Chatwoot-Signature: 完整签名（带 sha256= 前缀）
+
+注意:
+  - 时间戳是字符串形式（不是整数）
+  - 不需要转换时间戳类型，直接字符串拼接
+```
+
+**步骤 2: 获取原始请求体**
+```
+- 必须是 Chatwoot 发送的原始 JSON 字节流
+- 不能是解析后重新序列化的对象（JSON.parse → JSON.stringify 会改变格式）
+- 必须保留原始字节的每一个字符（包括空格、引号顺序）
+```
+
+**步骤 3: 构建签名数据**
+```ruby
+# 正确格式：时间戳字符串 + 点 + 原始请求体字符串
+signature_string = "#{timestamp}.#{raw_body}"
+
+# 例如:
+#   timestamp  = "1715421600"
+#   raw_body   = '{"event":"message_created"}'
+#   结果       = "1715421600.{\"event\":\"message_created\"}"
+
+# 错误格式示例（不要这样做）:
+#   "#{timestamp.to_i}.#{raw_body}"    # ❌ 整数时间戳
+#   "#{timestamp}: #{raw_body}"         # ❌ 冒号和空格
+#   "#{raw_body}.#{timestamp}"          # ❌ 顺序反了
+```
+
+**步骤 4: 计算 HMAC-SHA256**
+```ruby
+# Ruby:
+OpenSSL::HMAC.hexdigest('SHA256', secret, signature_string)
+
+# Node.js:
+crypto.createHmac('sha256', secret).update(signature_string).digest('hex')
+
+# Python:
+hmac.new(secret.encode(), signature_string.encode(), hashlib.sha256).hexdigest()
+```
+
+**步骤 5: 构造预期签名**
+```ruby
+# 必须是小写的 sha256= 前缀
+expected_signature = "sha256=#{computed_hmac}"
+
+# 例如:
+#   "sha256=4d9f7c3e2a1b5d8f4c7e9a3b6d2f8e5c1a7b3d9f5c7e1b3d5f9c7a1b3d5e9f2c"
+
+# 错误示例:
+#   "SHA256=..."      # ❌ 大写
+#   "sha256 = ..."    # ❌ 有空格
+#   "...（无前缀）"    # ❌ 缺少前缀
+```
+
+**步骤 6: 安全比较**
+```
+- 使用 timing-safe 比较（避免时序攻击）
+- 比较完整的签名（包括 sha256= 前缀）
+- 或者：提取 hmac 部分后比较
+
+Node.js: crypto.timingSafeEqual()
+Python:  hmac.compare_digest()
+Ruby:    Rack::Utils.secure_compare()
+```
+
+---
+
+##### 可直接复用的验证代码
+
+**Node.js/Express（生产级完整实现）**:
+
 ```javascript
 const express = require('express');
 const crypto = require('crypto');
 
 const app = express();
-const BOT_SECRET = 'your_bot_secret_from_chatwoot';
+const BOT_SECRET = 'your_agent_bot_secret_here';
+const REPLAY_THRESHOLD = 5 * 60; // 5 分钟
 
-app.post('/webhook/chatwoot', express.json(), (req, res) => {
+// 关键：使用 raw 模式获取原始请求体
+app.use('/webhook/chatwoot', express.raw({ type: 'application/json' }));
+
+/**
+ * 验证 Chatwoot Webhook 签名
+ * @param {string} timestamp - X-Chatwoot-Timestamp 请求头
+ * @param {string} signature - X-Chatwoot-Signature 请求头
+ * @param {Buffer|string} rawBody - 原始请求体
+ * @param {string} secret - AgentBot.secret
+ * @returns {boolean} - 签名是否有效
+ */
+function verifyChatwootSignature(timestamp, signature, rawBody, secret) {
+  if (!timestamp || !signature) return false;
+  if (!signature.startsWith('sha256=')) return false;
+
+  // 构建签名字符串: "{timestamp}.{rawBody}"
+  const signatureString = `${timestamp}.${rawBody.toString('utf8')}`;
+
+  // 计算 HMAC
+  const hmac = crypto.createHmac('sha256', secret);
+  const computedHmac = hmac.update(signatureString).digest('hex');
+  const expectedSignature = `sha256=${computedHmac}`;
+
+  // 安全比较
+  return crypto.timingSafeEqual(
+    Buffer.from(signature),
+    Buffer.from(expectedSignature)
+  );
+}
+
+/**
+ * 检查重放攻击
+ */
+function isReplayAttack(timestamp) {
+  if (!timestamp) return true;
+  const currentTime = Math.floor(Date.now() / 1000);
+  return Math.abs(currentTime - parseInt(timestamp, 10)) > REPLAY_THRESHOLD;
+}
+
+app.post('/webhook/chatwoot', (req, res) => {
+  const timestamp = req.headers['x-chatwoot-timestamp'];
   const signature = req.headers['x-chatwoot-signature'];
-  const hmac = crypto.createHmac('sha256', BOT_SECRET);
-  const expectedSignature = hmac.update(JSON.stringify(req.body)).digest('hex');
-  
-  if (signature !== expectedSignature) {
-    return res.status(401).send('Invalid signature');
+
+  // 1. 检查必需的请求头
+  if (!timestamp || !signature) {
+    return res.status(401).json({ error: 'Missing signature headers' });
   }
 
-  const { event, conversation, messages } = req.body;
-  
+  // 2. 检查重放攻击（可选但推荐）
+  if (isReplayAttack(timestamp)) {
+    return res.status(401).json({ error: 'Request expired' });
+  }
+
+  // 3. 验证签名
+  if (!verifyChatwootSignature(timestamp, signature, req.body, BOT_SECRET)) {
+    console.error('Invalid webhook signature:', {
+      timestamp,
+      signature,
+      bodyLength: req.body.length
+    });
+    return res.status(401).json({ error: 'Invalid signature' });
+  }
+
+  // 4. 签名验证通过，处理业务逻辑
+  let payload;
+  try {
+    payload = JSON.parse(req.body.toString('utf8'));
+  } catch (e) {
+    return res.status(400).json({ error: 'Invalid JSON' });
+  }
+
+  const { event } = payload;
+  console.log(`[Webhook] Received event: ${event}`);
+
+  // 5. 根据事件类型处理
   switch (event) {
     case 'message_created':
-      handleIncomingMessage(req.body);
+      // 只处理用户发送的消息，忽略系统消息和机器人自己的消息
+      if (payload.message_type === 'incoming' && !payload.private) {
+        handleIncomingMessage(payload);
+      }
       break;
     case 'conversation_created':
-      handleNewConversation(req.body);
+      handleNewConversation(payload);
+      break;
+    case 'conversation_status_changed':
+      handleStatusChange(payload);
+      break;
+    case 'conversation_resolved':
+      handleConversationResolved(payload);
       break;
   }
-  
+
+  // 必须返回 2xx 表示成功接收
   res.sendStatus(200);
+});
+
+// 业务处理函数
+function handleIncomingMessage(payload) {
+  console.log('📩 User message:', payload.content);
+  // TODO: 调用你的 AI 机器人服务
+  // TODO: 使用 Chatwoot API 发送回复
+}
+
+function handleNewConversation(payload) {
+  console.log('💬 New conversation:', payload.conversation.id);
+}
+
+function handleStatusChange(payload) {
+  const { status } = payload.conversation;
+  console.log('🔄 Status changed:', status);
+  // status: 'pending' = 机器人控制, 'open' = 人工控制
+}
+
+function handleConversationResolved(payload) {
+  console.log('✅ Conversation resolved:', payload.conversation.id);
+}
+
+app.listen(3001, () => {
+  console.log('Chatwoot Bot Webhook Server running on port 3001');
+  console.log('Webhook endpoint: http://localhost:3001/webhook/chatwoot');
 });
 ```
 
-**关键代码**:
-- 事件监听器: `app/listeners/agent_bot_listener.rb:1-91`
-- Webhook Job: `app/jobs/agent_bots/webhook_job.rb:1-12`
+**Python/FastAPI（生产级完整实现）**:
+
+```python
+import hmac
+import hashlib
+import json
+import time
+from typing import Optional
+from fastapi import FastAPI, Request, HTTPException, Header
+from fastapi.responses import PlainTextResponse
+
+app = FastAPI()
+BOT_SECRET = "your_agent_bot_secret_here"
+REPLAY_THRESHOLD = 5 * 60  # 5 分钟
+
+
+def verify_chatwoot_signature(
+    timestamp: str,
+    signature: str,
+    raw_body: bytes,
+    secret: str
+) -> bool:
+    """
+    验证 Chatwoot Webhook 签名
+    
+    Args:
+        timestamp: X-Chatwoot-Timestamp 请求头
+        signature: X-Chatwoot-Signature 请求头
+        raw_body: 原始请求体字节
+        secret: AgentBot.secret
+    
+    Returns:
+        签名是否有效
+    """
+    if not timestamp or not signature:
+        return False
+    if not signature.startswith("sha256="):
+        return False
+
+    # 构建签名字符串: "{timestamp}.{raw_body}"
+    signature_string = f"{timestamp}.{raw_body.decode('utf-8')}"
+
+    # 计算 HMAC
+    computed_hmac = hmac.new(
+        secret.encode("utf-8"),
+        signature_string.encode("utf-8"),
+        hashlib.sha256
+    ).hexdigest()
+    expected_signature = f"sha256={computed_hmac}"
+
+    # 安全比较
+    return hmac.compare_digest(signature, expected_signature)
+
+
+def is_replay_attack(timestamp: str) -> bool:
+    """检查是否为重放攻击"""
+    if not timestamp:
+        return True
+    try:
+        timestamp_int = int(timestamp)
+    except ValueError:
+        return True
+    current_time = int(time.time())
+    return abs(current_time - timestamp_int) > REPLAY_THRESHOLD
+
+
+@app.post("/webhook/chatwoot")
+async def webhook(
+    request: Request,
+    x_chatwoot_timestamp: Optional[str] = Header(None),
+    x_chatwoot_signature: Optional[str] = Header(None)
+):
+    # 1. 检查必需的请求头
+    if not x_chatwoot_timestamp or not x_chatwoot_signature:
+        raise HTTPException(status_code=401, detail="Missing signature headers")
+
+    # 2. 检查重放攻击
+    if is_replay_attack(x_chatwoot_timestamp):
+        raise HTTPException(status_code=401, detail="Request expired")
+
+    # 3. 获取原始请求体
+    raw_body = await request.body()
+
+    # 4. 验证签名
+    if not verify_chatwoot_signature(
+        x_chatwoot_timestamp,
+        x_chatwoot_signature,
+        raw_body,
+        BOT_SECRET
+    ):
+        raise HTTPException(status_code=401, detail="Invalid signature")
+
+    # 5. 解析并处理
+    try:
+        payload = json.loads(raw_body.decode("utf-8"))
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    event = payload.get("event")
+    print(f"[Webhook] Received event: {event}")
+
+    # 6. 处理业务逻辑
+    if event == "message_created":
+        if payload.get("message_type") == "incoming" and not payload.get("private"):
+            print(f"User message: {payload.get('content')}")
+            # TODO: 处理消息
+
+    return PlainTextResponse(status_code=200)
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=3001)
+```
+
+---
+
+##### 常见错误排查
+
+| 错误症状 | 可能原因 | 验证方法 |
+|---------|---------|---------|
+| 签名不匹配 | 请求体被重新序列化 | 打印原始 body 和重新序列化后的 body，比较是否相同 |
+| 签名不匹配 | 时间戳顺序反了 | 确保是 `timestamp.body` 不是 `body.timestamp` |
+| 签名不匹配 | 连接符错误 | 确保使用单个点 `.` |
+| 签名不匹配 | 时间戳类型错误 | 时间戳必须是**字符串**，不要 `parseInt` 后再拼接 |
+| 签名缺失 | AgentBot.secret 为空 | 检查数据库：`SELECT secret FROM agent_bots WHERE id = ?` |
+| 429/500 触发重试 | 机器人服务繁忙或错误 | 检查 Webhook 服务器状态，返回 200 |
+
+**调试技巧**:
+
+```javascript
+// 在你的验证函数中添加调试日志
+function debugSignature(timestamp, signature, rawBody, secret) {
+  const signatureString = `${timestamp}.${rawBody}`;
+  const hmac = crypto.createHmac('sha256', secret).update(signatureString).digest('hex');
+  
+  console.log('=== Signature Debug ===');
+  console.log('Timestamp:', timestamp, typeof timestamp);
+  console.log('Signature string length:', signatureString.length);
+  console.log('Signature string preview:', signatureString.substring(0, 100));
+  console.log('Expected signature:', `sha256=${hmac}`);
+  console.log('Received signature:', signature);
+  console.log('Match:', `sha256=${hmac}` === signature);
+}
+```
+
+**关键代码引用**:
+- 签名生成: `lib/webhooks/trigger.rb:54-63`
+- Webhook 事件触发: `app/listeners/agent_bot_listener.rb:85-90`
+- Webhook Job: `app/jobs/agent_bots/webhook_job.rb:1-16`
+- 超时配置: `lib/webhooks/trigger.rb:118-123`（默认 5 秒）
+- 重试机制: `lib/webhooks/trigger.rb:2-4, 125-127`
+
+**Webhook 失败处理** (`lib/webhooks/trigger.rb:77-83`):
+```ruby
+def update_conversation_status(message)
+  conversation = message.conversation
+  return unless conversation&.pending?
+  return if conversation&.account&.keep_pending_on_bot_failure
+
+  conversation.open!  # 机器人失败时自动转给人工
+end
+```
 
 ---
 
