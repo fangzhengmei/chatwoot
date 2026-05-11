@@ -111,6 +111,63 @@ end
 | 会话处理时间差异大，需负载均衡 | Balanced |
 | 企业版高级功能已启用 | 两者皆可，根据业务选择 |
 
+### 2.4 Balanced 并列最小负载时的 Tie-Break 与公平性影响
+
+**核心代码** (`enterprise/app/services/enterprise/auto_assignment/balanced_selector.rb:10`)：
+
+```ruby
+agent_users.min_by { |user| assignment_counts[user.id] || 0 }
+```
+
+**Tie-Break 机制**：
+
+当多个 agent 具有相同的最小负载时，Ruby 的 `Enumerable#min_by` 行为是：
+
+1. **顺序敏感性**：返回数组中**第一个**遇到的最小值
+2. **无二次排序**：没有任何二级排序条件（如 ID、加入时间、最近分配时间等）
+3. **依赖迭代顺序**：最终选择依赖 `available_agents.map(&:user)` 的数组顺序
+
+**数组顺序来源**：
+
+```ruby
+# app/services/auto_assignment/assignment_service.rb:48
+agents = filter_agents_by_team(inbox.available_agents, conversation)
+
+# app/models/concerns/inbox_agent_availability.rb:8-11
+inbox_members
+  .joins(:user)
+  .where(users: { id: online_agent_ids })
+  .includes(:user)
+```
+
+由于 ActiveRecord 查询未显式 `order`，顺序取决于：
+- 数据库的默认返回顺序（通常是 `id ASC` 或插入顺序）
+- `filter_agents_by_team` 的 `where(user_id: team_member_ids)` 过滤结果顺序
+
+**公平性影响**：
+
+| 影响类型 | 具体表现 |
+|---------|---------|
+| **短期偏差** | 连续多个并列负载的会话可能全部分配给数组中的第一个 agent |
+| **长期不公平** | 如果 agent 列表顺序长期稳定，靠前的 agent 会系统性地获得更多并列负载下的分配 |
+| **与 Round Robin 对比** | 轮询通过 Redis 队列确保轮换，而 balanced 在并列时缺乏此保障 |
+
+**测试确认** (`spec/enterprise/services/enterprise/auto_assignment/balanced_selector_spec.rb:48-58`)：
+
+```ruby
+it 'selects any agent when agents have equal workload' do
+  # All agents have same number of conversations
+  [member1, member2, member3].each do |member|
+    create(:conversation, inbox: inbox, assignee: member.user, status: 'open')
+  end
+
+  selected_agent = selector.select_agent(available_agents)
+
+  # Should select one of the agents (when equal, min_by returns the first one it finds)
+  expect([agent1, agent2, agent3]).to include(selected_agent)
+end
+```
+
 ---
 
 ## 3. 跨团队工作量分配规则
