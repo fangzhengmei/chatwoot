@@ -266,16 +266,174 @@ end
 
 Widget API 限流受 `ENABLE_RACK_ATTACK_WIDGET_API` 控制（默认 `true`），可通过环境变量关闭。
 
+**代码结构** (`rack_attack.rb:176-191`):
+
+```ruby
+if ActiveModel::Type::Boolean.new.cast(ENV.fetch('ENABLE_RACK_ATTACK_WIDGET_API', true))
+  ## Prevent Conversation Bombing on Widget APIs ###
+  throttle('api/v1/widget/conversations', limit: 6, period: 12.hours) do |req|
+    req.ip if req.path_without_extentions == '/api/v1/widget/conversations' && req.post?
+  end
+
+  ## Prevent Contact update Bombing in Widget API ###
+  throttle('api/v1/widget/contacts', limit: 60, period: 1.hour) do |req|
+    req.ip if req.path_without_extentions == '/api/v1/widget/contacts' && (req.patch? || req.put?)
+  end
+
+  ## Prevent Conversation Bombing through multiple sessions
+  throttle('widget?website_token={website_token}&cw_conversation={x-auth-token}', limit: 5, period: 1.hour) do |req|
+    req.ip if req.path_without_extentions == '/widget' && ActionDispatch::Request.new(req.env).params['cw_conversation'].blank?
+  end
+end
+```
+
 **逐规则核对**:
 
-| 限流规则 | 代码位置 | 路径匹配 | HTTP 方法 | 计数键 | 阈值 | 窗口 | 是否覆盖 `/api/v1/widget/events` |
-|---------|---------|---------|-----------|--------|------|------|-------------------------------|
-| **req/ip** | `rack_attack.rb:70` | **所有路径** | 所有 | `req.ip` | 3000 (可通过 `RACK_ATTACK_LIMIT` 配置) | 1 分钟 | ✅ **覆盖**（作为全局 fallback） |
-| **api/v1/widget/conversations** | `rack_attack.rb:178-180` | `/api/v1/widget/conversations` | POST | `req.ip` | 6 | 12 小时 | ❌ **不覆盖**（路径不匹配） |
-| **api/v1/widget/contacts** | `rack_attack.rb:183-185` | `/api/v1/widget/contacts` | PATCH/PUT | `req.ip` | 60 | 1 小时 | ❌ **不覆盖**（路径不匹配） |
-| **widget load** | `rack_attack.rb:188-190` | `/widget` | 所有 | `req.ip` | 5 | 1 小时 | ❌ **不覆盖**（路径不匹配） |
+| 限流规则 | 代码位置 | 路径匹配 | HTTP 方法 | 计数键 | 阈值 | 窗口 | 是否覆盖 `/api/v1/widget/events` | 是否覆盖 `/api/v1/widget/config` |
+|---------|---------|---------|-----------|--------|------|------|-------------------------------|-------------------------------|
+| **req/ip** (全局) | `rack_attack.rb:70` | **所有路径** | 所有 | `req.ip` | 3000 (可通过 `RACK_ATTACK_LIMIT` 配置) | 1 分钟 | ✅ **覆盖**（作为全局 fallback） | ✅ **覆盖**（作为全局 fallback） |
+| **api/v1/widget/conversations** | `rack_attack.rb:178-180` | `/api/v1/widget/conversations` | POST | `req.ip` | 6 | 12 小时 | ❌ **不覆盖** | ❌ **不覆盖** |
+| **api/v1/widget/contacts** | `rack_attack.rb:183-185` | `/api/v1/widget/contacts` | PATCH/PUT | `req.ip` | 60 | 1 小时 | ❌ **不覆盖** | ❌ **不覆盖** |
+| **widget load** | `rack_attack.rb:188-190` | `/widget` | 所有 | `req.ip` | 5 | 1 小时 | ❌ **不覆盖** | ❌ **不覆盖** |
 
-**关键发现**: `/api/v1/widget/events` **没有专门的限流规则**，只受最宽松的全局 `req/ip` 规则限制：
+**关键发现**: 
+- `/api/v1/widget/events` **没有专门的限流规则**
+- `/api/v1/widget/config` **没有专门的限流规则**
+- 两者都只受最宽松的全局 `req/ip` 规则限制：
+
+#### 5.4.2.1 `/api/v1/widget/config` 接口限流分析
+
+**路由**: `config/routes.rb:422` → `resource :config, only: [:create]`
+
+**控制器**: `app/controllers/api/v1/widget/configs_controller.rb`
+
+**核心逻辑**:
+
+```ruby
+def create
+  build_contact   # 创建新 contact_inbox（如果不存在）
+  set_token       # 下发 X-Auth-Token (JWT)
+end
+
+def build_contact
+  return if @contact.present?
+  @contact_inbox = @web_widget.create_contact_inbox(additional_attributes)
+  @contact = @contact_inbox.contact
+end
+
+def set_token
+  payload = { source_id: @contact_inbox.source_id, inbox_id: @web_widget.inbox.id }
+  @token = ::Widget::TokenService.new(payload: payload).generate_token
+end
+```
+
+**Token 有效期**: `app/services/widget/token_service.rb:24-26`
+
+```ruby
+DEFAULT_EXPIRY_DAYS = 180
+
+def expire_in
+  token_expiry_value = InstallationConfig.find_by(name: 'WIDGET_TOKEN_EXPIRY')&.value
+  (token_expiry_value.presence || DEFAULT_EXPIRY_DAYS).to_i
+end
+```
+
+**`/api/v1/widget/config` 限流评估**:
+
+| 维度 | 评估结果 | 说明 |
+|-----|---------|------|
+| **是否被限流** | ✅ 是，但非常宽松 | 仅受 `req/ip` 全局规则限制 |
+| **专门规则** | ❌ 无 | 没有针对 config 接口的专门限流 |
+| **计数维度** | ❌ 仅按 IP | 不按 website_token 维度 |
+| **阈值** | 3000 req/min (默认) | 每次调用都可能创建新的 contact_inbox |
+| **影响** | ⚠️ 高 | 可被用于批量创建 contact_inbox，为后续 campaign 触发铺路 |
+
+#### 5.4.2.2 `ENABLE_RACK_ATTACK_WIDGET_API` 关闭时的规则影响
+
+**修正结论**: 当 `ENABLE_RACK_ATTACK_WIDGET_API=false` 时：
+
+| 限流规则 | 是否失效 | 原因 |
+|---------|---------|------|
+| `req/ip` (全局) | ❌ **仍生效** | 在 `if` 块**外部**定义，不受此开关控制 |
+| `api/v1/widget/conversations` | ✅ **失效** | 在 `if` 块**内部**定义 |
+| `api/v1/widget/contacts` | ✅ **失效** | 在 `if` 块**内部**定义 |
+| `widget?website_token=...` | ✅ **失效** | 在 `if` 块**内部**定义 |
+| 所有认证相关限流 (login/reset_password 等) | ❌ **仍生效** | 在另一个独立的 `if` 块中 |
+| 所有应用 API 限流 (reports/upload 等) | ❌ **仍生效** | 在另一个独立的 `if` 块中 |
+
+**关键修正**: 之前的结论认为关闭此开关会完全关闭 Widget 限流，这是**错误的**。实际上：
+- `ENABLE_RACK_ATTACK_WIDGET_API` **只控制 4 条 Widget 专用规则**
+- **全局 `req/ip` 规则（3000/min）不受影响**，始终生效
+- 这意味着即使关闭 Widget 专用限流，仍有 3000 req/min 的兜底保护
+
+#### 5.4.2.3 环境开关组合风险矩阵
+
+| `ENABLE_RACK_ATTACK` | `ENABLE_RACK_ATTACK_WIDGET_API` | 全局 `req/ip` 规则 | Widget 专用规则 | 风险等级 | 风险说明 |
+|---------------------|--------------------------------|------------------|---------------|---------|---------|
+| `true` (默认) | `true` (默认) | ✅ 3000 req/min | ✅ 4 条规则生效 | ⚠️ 中等 | 阈值过高，但有多层保护 |
+| `true` (默认) | `false` | ✅ 3000 req/min | ❌ 全部失效 | ⚠️ 高 | Widget 专用保护消失，仅剩全局兜底 |
+| `false` | `true` | ❌ 完全失效 | ⚠️ 条件依赖 | 🔴 **极高** | Rack::Attack 整体关闭，所有规则失效 |
+| `false` | `false` | ❌ 完全失效 | ❌ 完全失效 | 🔴 **极高** | 无任何限流保护 |
+
+**注意**: `ENABLE_RACK_ATTACK` 在生产环境默认为 `true`，可完全禁用整个 Rack::Attack。当 `ENABLE_RACK_ATTACK=false` 时，**所有限流规则都不生效**，包括全局 `req/ip` 规则。
+
+#### 5.4.2.4 真实攻击路径：config → events 完整链路
+
+**正常用户流程**:
+
+```
+1. GET /widget?website_token=xxx
+   ↓
+   WidgetsController#index (服务端渲染)
+   ↓
+   build_contact (创建 contact_inbox)
+   ↓
+   set_token (下发 X-Auth-Token)
+   ↓
+2. 前端加载后：
+   - 等待 time_on_page 秒
+   - 检查 URL 匹配
+   - 检查营业时间
+   ↓
+3. POST /api/v1/widget/events
+   ↓
+   Dispatcher → CampaignListener → CampaignConversationBuilder
+   ↓
+   创建 Conversation + Message
+```
+
+**攻击者流程（绕过前端）**:
+
+```
+1. POST /api/v1/widget/config?website_token=xxx
+   └─ 限流门槛：req/ip (3000/min)
+   └─ 每次调用创建新的 contact_inbox
+   └─ 返回 X-Auth-Token (JWT，有效期 180 天)
+   ↓
+2. POST /api/v1/widget/events?website_token=xxx
+   body: { name: 'campaign.triggered', event_info: {...} }
+   Headers: X-Auth-Token: <token_from_step_1>
+   └─ 限流门槛：req/ip (3000/min)
+   └─ 使用新的 contact_inbox 触发 campaign
+   └─ 行级锁 + 幂等检查：对新 contact_inbox 无效
+   ↓
+3. 重复步骤 1-2，每次使用不同的 source_id
+   └─ 每分钟可创建 3000 个 contact_inbox + 3000 个 campaign 触发
+```
+
+**每一步的限流门槛分析**:
+
+| 步骤 | 接口 | 限流规则 | 阈值 | 是否可绕过 | 攻击成本 |
+|-----|------|---------|------|-----------|---------|
+| 1. 获取 token | `POST /api/v1/widget/config` | `req/ip` (全局) | 3000 req/min | 分布式攻击可绕过 | 低 |
+| 2. 触发 campaign | `POST /api/v1/widget/events` | `req/ip` (全局) | 3000 req/min | 分布式攻击可绕过 | 低 |
+| 2a. 后端幂等 | `CampaignConversationBuilder` | 行级锁 + 对话存在检查 | 1 per contact_inbox | 使用新 contact_inbox 绕过 | 零 |
+
+**关键发现**: 
+- 攻击者可以**每秒创建 50 个新 contact_inbox**（3000/min）
+- 每个新 contact_inbox 可以**成功触发一次 campaign**
+- **行级锁和幂等检查对新用户无效**
+- **分布式攻击可将容量扩大 N 倍**（N = IP 数量）
 
 ```ruby
 # rack_attack.rb:70
