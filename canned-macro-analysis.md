@@ -142,6 +142,170 @@ end
   - `global`：账户内所有用户可见
 - 严格的动作格式验证，确保 `actions` 数组中的 `action_name` 必须在白名单内
 
+#### 3.1.3 可见性过滤（List 级别）
+
+位置：`app/models/macro.rb`
+
+```ruby
+def self.with_visibility(user, _params)
+  records = Current.account.macros.global
+  records = records.or(personal.where(created_by_id: user.id, account_id: Current.account.id))
+  records.order(:id)
+end
+```
+
+**查询逻辑：**
+- 基础集合：`Current.account.macros.global`（所有全局宏）
+- 叠加集合：`personal.where(created_by_id: user.id)`（当前用户创建的个人宏）
+- 使用 `or` 连接，返回用户有权查看的所有宏
+
+**可见性规则汇总：**
+
+| 宏类型 | 谁可以在列表中看到 |
+|--------|-------------------|
+| `global` | 账户内所有用户 |
+| `personal` | 仅创建者本人 |
+
+---
+
+### 3.1.4 可见性设置限制
+
+位置：`app/models/macro.rb`
+
+```ruby
+def set_visibility(user, params)
+  self.visibility = params[:visibility]
+  self.visibility = :personal if user.agent?
+end
+```
+
+**规则：**
+- **管理员（administrator）**：可以自由设置 `personal` 或 `global`
+- **客服（agent）**：无论参数传入什么，强制设为 `personal`
+- 客服无法创建全局宏
+
+---
+
+### 3.1.5 权限策略（Pundit）
+
+位置：`app/policies/macro_policy.rb`
+
+```ruby
+class MacroPolicy < ApplicationPolicy
+  def index?
+    true
+  end
+
+  def create?
+    true
+  end
+
+  def show?
+    @record.global? || author?
+  end
+
+  def update?
+    return @account_user.administrator? if @record.global?
+
+    author?
+  end
+
+  def destroy?
+    return @account_user.administrator? if @record.global?
+
+    author?
+  end
+
+  def execute?
+    @record.global? || author?
+  end
+
+  private
+
+  def author?
+    @record.created_by == @account_user.user
+  end
+end
+```
+
+**权限规则矩阵：**
+
+| 操作 | 条件 | 授权判定 |
+|------|------|---------|
+| `index?` | 无特殊条件 | 始终 `true`（列表级别的过滤由 `with_visibility` 处理） |
+| `create?` | 无特殊条件 | 始终 `true`（但创建时的可见性由 `set_visibility` 限制） |
+| `show?` | `global?` 或 `author?` | 全局宏对所有人可见；个人宏仅作者可见 |
+| `execute?` | `global?` 或 `author?` | 与 `show?` 规则相同 |
+| `update?` | global → admin；personal → author | 全局宏仅管理员可改；个人宏仅作者可改 |
+| `destroy?` | global → admin；personal → author | 全局宏仅管理员可删；个人宏仅作者可删 |
+
+**特殊边界情况：**
+
+1. **孤儿全局宏**（作者已被删除）：
+   - `global?` 为 `true`，`created_by` 为 `nil`
+   - `author?` 返回 `false`
+   - 但 `global?` 为 `true`，所以 `show?` 和 `execute?` 仍返回 `true`
+   - `update?` 和 `destroy?` 要求 `administrator?`，所以仅管理员可操作
+
+2. **作者降级为 agent 的全局宏**：
+   - 宏仍是 `global`
+   - `update?` 要求 `administrator?`
+   - 即使原作者曾是 admin，现在降级为 agent 后也无法修改/删除自己创建的全局宏
+
+---
+
+### 3.1.6 执行前的完整校验链路
+
+位置：`app/controllers/api/v1/accounts/macros_controller.rb`
+
+```ruby
+before_action :fetch_macro, only: [:show, :update, :destroy, :execute]
+before_action :check_authorization, only: [:show, :update, :destroy, :execute]
+
+def fetch_macro
+  @macro = Current.account.macros.find_by(id: params[:id])
+end
+
+def check_authorization
+  authorize(@macro) if @macro.present?
+end
+
+def execute
+  ::MacrosExecutionJob.perform_later(@macro, conversation_ids: params[:conversation_ids], user: Current.user)
+  head :ok
+end
+```
+
+**完整执行校验链路：**
+
+```
+POST /macros/:id/execute
+    ↓
+1. fetch_macro: Current.account.macros.find_by(id: params[:id])
+   ├── 限制在 Current.account 内查询（租户隔离）
+   └── 找不到返回 nil，后续 authorize 不报错但 @macro 为 nil
+    ↓
+2. check_authorization: authorize(@macro) if @macro.present?
+   └── 调用 MacroPolicy#execute?
+       ├── global? → true（全局宏任何人可执行）
+       └── author? → created_by == current_user（个人宏仅作者可执行）
+    ↓
+3. 若授权通过
+   └── MacrosExecutionJob.perform_later(@macro, conversation_ids, Current.user)
+    ↓
+4. MacrosExecutionJob#perform
+   └── account.conversations.where(display_id: conversation_ids)
+       └── 二次验证对话属于同一账户
+```
+
+**三层校验保障：**
+
+| 层次 | 校验点 | 代码位置 | 失败表现 |
+|------|--------|---------|---------|
+| 第1层 | 租户级查询限制 | `Current.account.macros.find_by` | @macro = nil，不执行 |
+| 第2层 | Pundit 权限校验 | `MacroPolicy#execute?` | 抛出 Pundit::NotAuthorizedError → 403 |
+| 第3层 | 对话归属验证 | `account.conversations.where` | 不在同一账户的对话被过滤 |
+
 ### 3.2 支持的动作类型
 
 宏命令支持以下动作（定义在 `ACTIONS_ATTRS` 常量中）：
