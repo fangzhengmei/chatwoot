@@ -478,7 +478,658 @@ AgentBotListener 通知机器人
 - 支持条件匹配和动作执行
 - 可用于: 自动分配、自动打标、发送模板消息等
 
-## 11. 总结
+## 12. 完整时序与可执行步骤
+
+### 12.1 阶段一：接入准备
+
+#### 12.1.1 创建 AgentBot (Webhook 机器人)
+
+**API 端点**:
+- 账户级 API: `POST /api/v1/accounts/{account_id}/agent_bots`
+- 平台级 API: `POST /platform/api/v1/agent_bots`
+
+**请求示例**:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/agent_bots \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: YOUR_AGENT_ACCESS_TOKEN" \
+  -d '{
+    "name": "My Support Bot",
+    "description": "智能客服机器人",
+    "outgoing_url": "https://your-bot-server.com/webhook/chatwoot",
+    "bot_type": "webhook",
+    "bot_config": {
+      "welcome_message": "您好，我是智能助手，请问有什么可以帮您？"
+    }
+  }'
+```
+
+**响应字段**:
+```json
+{
+  "id": 1,
+  "name": "My Support Bot",
+  "outgoing_url": "https://your-bot-server.com/webhook/chatwoot",
+  "bot_type": "webhook",
+  "bot_config": {
+    "welcome_message": "您好，我是智能助手..."
+  },
+  "access_token": "bot_access_token_xxx"
+}
+```
+
+**关键代码**:
+- 账户级控制器: `app/controllers/api/v1/accounts/agent_bots_controller.rb:12-15`
+- 平台级控制器: `app/controllers/platform/api/v1/agent_bots_controller.rb:11-16`
+
+#### 12.1.2 绑定机器人到收件箱
+
+将机器人与特定渠道（收件箱）关联，使机器人能够接收该渠道的消息。
+
+**Rails 控制台操作**:
+```ruby
+account = Account.find(1)
+inbox = account.inboxes.find_by(name: "Website Chat")
+agent_bot = account.agent_bots.find(1)
+
+# 创建关联
+agent_bot_inbox = AgentBotInbox.create!(
+  inbox: inbox,
+  agent_bot: agent_bot,
+  status: :active
+)
+```
+
+**验证绑定**:
+```ruby
+inbox.active_bot?  # => true
+inbox.agent_bot_inbox.status  # => "active"
+```
+
+**关键代码**:
+- 激活判断: `app/models/inbox.rb:173-176`
+- 关联模型: `app/models/agent_bot_inbox.rb:14-29`
+
+#### 12.1.3 准备 Webhook 接收服务
+
+机器人需要实现一个 HTTP 端点来接收 Chatwoot 推送的事件。
+
+**事件类型及处理**:
+
+| 事件类型 (event) | 触发时机 | 处理逻辑 |
+|-----------------|---------|---------|
+| `webwidget_triggered` | 访客打开聊天窗口 | 可选：发送欢迎消息 |
+| `message_created` | 新消息创建 | 核心：处理用户消息 |
+| `message_updated` | 消息更新（如表单提交） | 处理交互式组件响应 |
+| `conversation_created` | 新会话创建 | 初始化会话状态 |
+| `conversation_updated` | 会话属性变更 | 同步会话状态 |
+| `conversation_opened` | 会话重新打开 | 重新接管会话 |
+| `conversation_resolved` | 会话已解决 | 清理会话上下文 |
+| `conversation_status_changed` | 会话状态变更 | 跟踪控制权变化 |
+
+**Webhook 签名验证**:
+- Chatwoot 使用 `secret` 字段生成 HMAC 签名
+- 签名在请求头 `X-Chatwoot-Signature` 中传递
+- 验证方式: `HMAC-SHA256(secret, request_body)`
+
+**示例 Webhook 处理 (Node.js/Express)**:
+```javascript
+const express = require('express');
+const crypto = require('crypto');
+
+const app = express();
+const BOT_SECRET = 'your_bot_secret_from_chatwoot';
+
+app.post('/webhook/chatwoot', express.json(), (req, res) => {
+  const signature = req.headers['x-chatwoot-signature'];
+  const hmac = crypto.createHmac('sha256', BOT_SECRET);
+  const expectedSignature = hmac.update(JSON.stringify(req.body)).digest('hex');
+  
+  if (signature !== expectedSignature) {
+    return res.status(401).send('Invalid signature');
+  }
+
+  const { event, conversation, messages } = req.body;
+  
+  switch (event) {
+    case 'message_created':
+      handleIncomingMessage(req.body);
+      break;
+    case 'conversation_created':
+      handleNewConversation(req.body);
+      break;
+  }
+  
+  res.sendStatus(200);
+});
+```
+
+**关键代码**:
+- 事件监听器: `app/listeners/agent_bot_listener.rb:1-91`
+- Webhook Job: `app/jobs/agent_bots/webhook_job.rb:1-12`
+
+---
+
+### 12.2 阶段二：机器人接管会话
+
+#### 12.2.1 新会话创建时的自动接管
+
+当用户在已绑定机器人的收件箱发起新会话时，机器人会自动接管。
+
+**触发条件** (`app/models/conversation.rb:255-267`):
+```ruby
+def determine_conversation_status
+  self.status = :resolved and return if contact.blocked?
+  return handle_campaign_status if campaign.present?
+  self.status = :pending if inbox.active_bot?  # 关键：机器人激活时设为 pending
+end
+```
+
+**会话状态流转**:
+1. 用户发送第一条消息
+2. 会话创建，`status` 被设为 `pending`
+3. `AgentBotListener` 监听到 `message_created` 事件
+4. 通过 `AgentBots::WebhookJob` 异步推送事件到机器人 Webhook
+
+**Webhook Payload 示例 (message_created)**:
+```json
+{
+  "event": "message_created",
+  "id": 1,
+  "content": "我想查询订单",
+  "message_type": "incoming",
+  "private": false,
+  "sender": {
+    "id": 5,
+    "name": "Customer",
+    "type": "contact"
+  },
+  "conversation": {
+    "id": 101,
+    "status": "pending",
+    "assignee_id": null,
+    "assignee_agent_bot_id": 1
+  },
+  "inbox": {
+    "id": 1,
+    "name": "Website Chat"
+  },
+  "account": {
+    "id": 1,
+    "name": "My Company"
+  }
+}
+```
+
+#### 12.2.2 机器人发送回复消息
+
+机器人通过 Chatwoot API 发送回复消息。
+
+**API 端点**:
+```
+POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/messages
+```
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/messages \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: BOT_ACCESS_TOKEN" \
+  -d '{
+    "content": "您好！请问您的订单号是多少？",
+    "private": false
+  }'
+```
+
+**带交互组件的消息 (表单/按钮)**:
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/messages \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: BOT_ACCESS_TOKEN" \
+  -d '{
+    "content": "请选择您的问题类型：",
+    "content_type": "input_select",
+    "content_attributes": {
+      "items": [
+        { "title": "订单查询", "value": "order_status" },
+        { "title": "退货申请", "value": "return_request" },
+        { "title": "其他问题", "value": "other" }
+      ]
+    }
+  }'
+```
+
+**关键代码**:
+- 消息创建 API: 参考 MessagesController
+
+#### 12.2.3 机器人处理会话状态
+
+机器人需要关注以下会话属性来判断控制权:
+
+| 字段 | 值 | 含义 |
+|-----|---|------|
+| `status` | `pending` | 机器人控制中 |
+| `status` | `open` | 人工控制中 |
+| `assignee_agent_bot_id` | 非 null | 当前会话被分配给机器人 |
+| `assignee_id` | 非 null | 当前会话被分配给人工客服 |
+
+**检查控制权的 Webhook 处理逻辑**:
+```javascript
+function isBotInControl(payload) {
+  const { conversation } = payload;
+  // 状态为 pending 且没有被分配给人工
+  return conversation.status === 'pending' && 
+         conversation.assignee_id === null;
+}
+```
+
+---
+
+### 12.3 阶段三：人工介入 (控制权切换：机器人 → 人工)
+
+#### 12.3.1 触发条件总览
+
+| 触发方式 | 触发主体 | 触发条件 | 代码位置 |
+|---------|---------|---------|---------|
+| 机器人主动 handoff | 机器人 | 返回 `handoff` action 或调用 API | `lib/integrations/bot_processor_service.rb:55-62` |
+| Dialogflow intent | Dialogflow | fulfillment payload 含 `action: handoff` | `lib/integrations/dialogflow/processor_service.rb:79-80` |
+| Captain HandoffTool | LLM 机器人 | 工具调用判定需要人工 | `enterprise/lib/captain/tools/handoff_tool.rb:1-51` |
+| 人工主动接管 | 客服人员 | 前端点击"接管"按钮 | `app/controllers/api/v1/accounts/conversations_controller.rb:81-92` |
+| 分配给人工客服 | 管理员/系统 | 调用分配 API 指定 assignee | `app/controllers/api/v1/accounts/conversations/assignments_controller.rb:1-45` |
+
+#### 12.3.2 方式一：机器人主动触发 handoff (Webhook 机器人)
+
+**通过 BotProcessorService 的 action 机制** (`lib/integrations/bot_processor_service.rb:55-62`):
+
+```ruby
+def process_action(message, action)
+  case action
+  when 'handoff'
+    message.conversation.bot_handoff!
+  when 'resolve'
+    message.conversation.resolved!
+  end
+end
+```
+
+**机器人通过消息 content 触发**:
+
+机器人发送消息时，在 `content_attributes` 中指定 `action`:
+
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/messages \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: BOT_ACCESS_TOKEN" \
+  -d '{
+    "content": "正在为您转接人工客服，请稍候...",
+    "content_attributes": {
+      "action": "handoff"
+    }
+  }'
+```
+
+**机器人直接通过 API 触发 handoff**:
+
+```bash
+# 方式1：通过 toggle_status API（机器人身份调用）
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/toggle_status \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: BOT_ACCESS_TOKEN" \
+  -d '{
+    "status": "open"
+  }'
+```
+
+**关键判断逻辑** (`app/controllers/api/v1/accounts/conversations_controller.rb:94-98`):
+```ruby
+def pending_to_open_by_bot?
+  return false unless Current.user.is_a?(AgentBot)
+  @conversation.status == 'pending' && params[:status] == 'open'
+end
+```
+
+#### 12.3.3 方式二：Dialogflow 触发 handoff
+
+Dialogflow 的 fulfillment payload 中包含 `action` 字段:
+
+```json
+{
+  "fulfillmentMessages": [
+    {
+      "payload": {
+        "action": "handoff"
+      }
+    }
+  ]
+}
+```
+
+**处理逻辑** (`lib/integrations/dialogflow/processor_service.rb:75-85`):
+```ruby
+def process_response(message, response)
+  fulfillment_messages = response.query_result['fulfillment_messages']
+  fulfillment_messages.each do |fulfillment_message|
+    content_params = generate_content_params(fulfillment_message)
+    if content_params['action'].present?
+      process_action(message, content_params['action'])  # 触发 handoff
+    else
+      create_conversation(message, content_params)
+    end
+  end
+end
+```
+
+#### 12.3.4 方式三：企业版 Captain LLM 机器人
+
+**HandoffTool 调用** (`enterprise/lib/captain/tools/handoff_tool.rb:5-42`):
+
+```ruby
+def perform(tool_context, reason: nil)
+  conversation = find_conversation(tool_context.state)
+  return 'Conversation not found' unless conversation
+
+  log_tool_usage('tool_handoff', {
+    conversation_id: conversation.id,
+    reason: reason || 'Agent requested handoff'
+  })
+
+  trigger_handoff(conversation, reason)
+end
+
+def trigger_handoff(conversation, reason)
+  conversation.messages.create!(
+    message_type: :outgoing,
+    private: true,
+    sender: @assistant,
+    account: conversation.account,
+    inbox: conversation.inbox,
+    content: reason
+  )
+  conversation.bot_handoff!  # 核心调用
+  send_out_of_office_message_if_applicable(conversation)
+end
+```
+
+**LLM 判断触发 handoff 的典型场景**:
+- 用户明确要求人工客服
+- 问题超出机器人知识库范围
+- 涉及敏感操作需要人工审核
+- 连续多次无法解决用户问题
+
+#### 12.3.5 方式四：人工客服主动接管
+
+**前端 UI 操作**:
+1. 客服在会话列表看到 `pending` 状态的会话
+2. 点击"接管"按钮或直接回复消息
+
+**API 调用方式**:
+```bash
+# 方式1：分配给指定客服
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/assignments \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: AGENT_ACCESS_TOKEN" \
+  -d '{
+    "assignee_id": 5
+  }'
+
+# 方式2：改变会话状态为 open
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/toggle_status \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: AGENT_ACCESS_TOKEN" \
+  -d '{
+    "status": "open"
+  }'
+```
+
+**互斥分配机制** (`app/services/conversations/assignment_service.rb:16-30`):
+```ruby
+def assign_agent
+  conversation.assignee = assignee
+  conversation.assignee_agent_bot = nil  # 自动清除机器人分配
+  conversation.save!
+  assignee
+end
+```
+
+**模型层面的保护** (`app/models/conversation.rb:249-253`):
+```ruby
+def reset_agent_bot_when_assignee_present
+  return if assignee_id.blank?
+  self.assignee_agent_bot_id = nil  # 确保机器人被清除
+end
+```
+
+#### 12.3.6 bot_handoff! 核心执行流程
+
+**方法定义** (`app/models/conversation.rb:161-165`):
+```ruby
+def bot_handoff!
+  update(waiting_since: Time.current) if waiting_since.blank?
+  open!  # pending → open
+  dispatcher_dispatch(CONVERSATION_BOT_HANDOFF)
+end
+```
+
+**执行步骤分解**:
+
+| 步骤 | 操作 | 说明 |
+|-----|------|------|
+| 1 | 设置 `waiting_since` | 记录人工响应等待开始时间，用于 SLA 计算 |
+| 2 | `open!` | 状态从 `pending` 变为 `open`，控制权移交人工 |
+| 3 | 派发 `CONVERSATION_BOT_HANDOFF` 事件 | 触发相关监听器处理 |
+
+**事件类型定义** (`lib/events/types.rb:20`):
+```ruby
+CONVERSATION_BOT_HANDOFF = 'conversation.bot_handoff'
+```
+
+---
+
+### 12.4 阶段四：再交回机器人 (控制权切换：人工 → 机器人)
+
+#### 12.4.1 触发条件
+
+| 触发方式 | 触发主体 | 说明 |
+|---------|---------|------|
+| 调用分配 API | 客服/管理员 | 显式指定 `assignee_type=AgentBot` |
+| 自动化规则 | 系统 | 基于规则自动分配回机器人 |
+| 已解决会话被用户重新打开 | 用户 | 机器人活跃时自动设为 pending |
+
+#### 12.4.2 方式一：通过分配 API 交回机器人
+
+**API 端点**:
+```
+POST /api/v1/accounts/{account_id}/conversations/{conversation_id}/assignments
+```
+
+**请求示例**:
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/conversations/101/assignments \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: AGENT_ACCESS_TOKEN" \
+  -d '{
+    "assignee_id": 1,
+    "assignee_type": "AgentBot"
+  }'
+```
+
+**关键参数**:
+- `assignee_id`: AgentBot 的 ID
+- `assignee_type`: 必须为 `"AgentBot"`（区分于 `"User"`）
+
+**控制器判断** (`app/controllers/api/v1/accounts/conversations/assignments_controller.rb:42-44`):
+```ruby
+def agent_bot_assignment?
+  params[:assignee_type].to_s == 'AgentBot'
+end
+```
+
+**分配服务处理** (`app/services/conversations/assignment_service.rb:23-30`):
+```ruby
+def assign_agent_bot
+  return unless agent_bot
+
+  conversation.assignee = nil  # 清除人工客服
+  conversation.assignee_agent_bot = agent_bot  # 设置机器人
+  conversation.save!
+  agent_bot
+end
+```
+
+#### 12.4.3 方式二：用户重新打开已解决会话
+
+**触发场景**:
+1. 会话已被人工客服标记为 `resolved`
+2. 用户再次发送新消息
+3. 收件箱仍有活跃机器人
+
+**自动状态切换** (`app/models/message.rb:424-431`):
+```ruby
+def reopen_resolved_conversation
+  if conversation.inbox.active_bot?
+    conversation.pending!  # 自动设为 pending，机器人接管
+  elsif conversation.inbox.api?
+    Current.executed_by = sender if reopened_by_contact?
+    conversation.open!
+  else
+    conversation.open!
+  end
+end
+```
+
+**验证** (`spec/models/message_spec.rb:262-271`):
+```ruby
+it 'will mark the conversation as pending if the agent bot is active' do
+  agent_bot = create(:agent_bot)
+  inbox = conversation.inbox
+  inbox.agent_bot = agent_bot
+  inbox.save!
+  conversation.resolved!
+  message.save!
+  
+  expect(conversation.open?).to be false
+  expect(conversation.pending?).to be true  # 已自动切换为机器人控制
+end
+```
+
+#### 12.4.4 方式三：通过自动化规则自动分配
+
+**AutomationRuleListener** (`app/listeners/automation_rule_listener.rb:1-86`) 可用于:
+- 当会话满足特定条件时自动分配给机器人
+- 例如：工作时间外自动交给机器人
+
+**规则触发事件**:
+- `conversation_created`
+- `conversation_updated`
+- `conversation_opened`
+- `conversation_resolved`
+- `message_created`
+
+---
+
+### 12.5 完整生命周期时序图
+
+```
+用户                           Chatwoot                      机器人                      人工客服
+ │                              │                              │                              │
+ │ 1. 发起新会话                 │                              │                              │
+ │─────────────────────────────>│                              │                              │
+ │                              │ 创建会话 status=pending       │                              │
+ │                              │─────────────────────────────>│                              │
+ │                              │    message.created 事件       │                              │
+ │                              │                              │                              │
+ │                              │ 2. 处理用户消息               │                              │
+ │                              │─────────────────────────────>│                              │
+ │                              │                              │ 解析意图，生成回复            │
+ │                              │<─────────────────────────────│                              │
+ │                              │                              │                              │
+ │ 3. 机器人回复                 │                              │                              │
+ │<─────────────────────────────│                              │                              │
+ │                              │                              │                              │
+ │ ...多轮对话...                │                              │                              │
+ │                              │                              │                              │
+ │ 4. 请求人工客服               │                              │                              │
+ │─────────────────────────────>│                              │                              │
+ │                              │─────────────────────────────>│                              │
+ │                              │                              │ 判定需要 handoff             │
+ │                              │<─────────────────────────────│                              │
+ │                              │                              │                              │
+ │                              │ 5. 执行 handoff               │                              │
+ │                              │ - status: pending→open       │                              │
+ │                              │ - 设置 waiting_since          │                              │
+ │                              │ - 派发 bot_handoff 事件       │                              │
+ │                              │                              │                              │
+ │                              │ 6. 通知人工客服               │                              │
+ │                              │────────────────────────────────────────────────────────────>│
+ │                              │                              │                              │ 查看待处理会话
+ │                              │                              │                              │                              │
+ │ 7. 人工客服接管               │                              │                              │
+ │                              │<────────────────────────────────────────────────────────────│
+ │                              │ - assignee_id=客服ID          │                              │
+ │                              │ - assignee_agent_bot_id=nil   │                              │
+ │                              │                              │                              │
+ │ 8. 人工客服回复               │                              │                              │
+ │<────────────────────────────────────────────────────────────│                              │
+ │                              │                              │                              │
+ │ ...人工处理...                │                              │                              │
+ │                              │                              │                              │
+ │                              │ 9. 交回机器人                 │                              │
+ │                              │<────────────────────────────────────────────────────────────│
+ │                              │ - 调用分配 API                │                              │
+ │                              │ - assignee_type=AgentBot      │                              │
+ │                              │ - status 保持 open 或手动设   │
+ │                              │   为 pending                   │                              │
+ │                              │                              │                              │
+ │                              │ 10. 通知机器人                │                              │
+ │                              │─────────────────────────────>│                              │
+ │                              │    conversation_updated       │                              │
+ │                              │                              │ 重新接管会话                  │
+ │                              │                              │                              │
+ │ 11. 机器人继续处理            │                              │                              │
+ │<─────────────────────────────│                              │                              │
+ │                              │                              │                              │
+```
+
+---
+
+## 13. 触发条件汇总表
+
+### 13.1 机器人接管会话的触发条件
+
+| 条件 | 状态变化 | 触发来源 | 代码位置 |
+|-----|---------|---------|---------|
+| 新会话创建 + 收件箱有活跃机器人 | `status: open → pending` | 系统自动 | `app/models/conversation.rb:261` |
+| 营销活动无发送人 + 收件箱有活跃机器人 | `status: open → pending` | 系统自动 | `app/models/conversation.rb:266` |
+| 用户重新打开已解决会话 + 收件箱有活跃机器人 | `status: resolved → pending` | 用户消息 | `app/models/message.rb:426-427` |
+| 通过 API 分配给机器人 | `assignee_agent_bot_id` 设置 | 显式调用 | `app/services/conversations/assignment_service.rb:23-30` |
+
+### 13.2 人工介入的触发条件
+
+| 条件 | 状态变化 | 触发来源 | 代码位置 |
+|-----|---------|---------|---------|
+| 机器人返回 `handoff` action | `status: pending → open` | 机器人 | `lib/integrations/bot_processor_service.rb:58` |
+| Dialogflow fulfillment 含 `action: handoff` | `status: pending → open` | Dialogflow | `lib/integrations/dialogflow/processor_service.rb:79-80` |
+| Captain HandoffTool 被调用 | `status: pending → open` | LLM 判定 | `enterprise/lib/captain/tools/handoff_tool.rb:38` |
+| 机器人调用 API 设 `status=open` | `status: pending → open` | 机器人 | `app/controllers/api/v1/accounts/conversations_controller.rb:84` |
+| 人工客服分配给自己 | `assignee_id` 设置 + 清除机器人 | 客服操作 | `app/services/conversations/assignment_service.rb:16-21` |
+| 人工客服直接回复 pending 会话 | 隐式接管 | 客服操作 | 模型回调 |
+| 自动化规则分配给人工 | `assignee_id` 设置 | 系统规则 | AutomationRule |
+
+### 13.3 关键状态与控制权关系
+
+| status | assignee_id | assignee_agent_bot_id | 控制权 | 说明 |
+|--------|------------|----------------------|-------|------|
+| `pending` | null | 非 null | 机器人 | 机器人活跃处理中 |
+| `pending` | null | null | 机器人(间接) | 收件箱有活跃机器人，但未直接分配 |
+| `open` | 非 null | null | 人工 | 指定人工客服处理中 |
+| `open` | null | null | 人工池 | 等待分配给人工客服 |
+| `resolved` | 任意 | 任意 | 无 | 会话已结束 |
+| `snoozed` | 任意 | 任意 | 无 | 会话已延迟 |
+
+---
+
+## 14. 总结
 
 Chatwoot 的机器人协作机制具有以下核心特点:
 
@@ -488,5 +1139,6 @@ Chatwoot 的机器人协作机制具有以下核心特点:
 4. **互斥分配**: 人工和机器人通过 `assignee_id` 和 `assignee_agent_bot_id` 实现互斥控制
 5. **灵活切换**: 支持机器人主动触发 (`bot_handoff!`) 和人工主动接管两种切换方式
 6. **企业级增强**: Captain 提供工具化的 LLM 机器人，支持结构化的 handoff 和 resolve 操作
+7. **完整的 API 支持**: 提供账户级和平台级 API 管理机器人，以及运行时分配控制
 
 这种设计使得 Chatwoot 能够灵活地在自动回复和人工介入之间切换，为客户提供无缝的客服体验。
