@@ -527,29 +527,97 @@ curl -X POST http://localhost:3000/api/v1/accounts/1/agent_bots \
 
 将机器人与特定渠道（收件箱）关联，使机器人能够接收该渠道的消息。
 
-**Rails 控制台操作**:
-```ruby
-account = Account.find(1)
-inbox = account.inboxes.find_by(name: "Website Chat")
-agent_bot = account.agent_bots.find(1)
-
-# 创建关联
-agent_bot_inbox = AgentBotInbox.create!(
-  inbox: inbox,
-  agent_bot: agent_bot,
-  status: :active
-)
+**API 端点**:
+```
+POST /api/v1/accounts/{account_id}/inboxes/{inbox_id}/set_agent_bot
 ```
 
-**验证绑定**:
+**请求参数**:
+| 参数 | 类型 | 必填 | 说明 |
+|-----|------|------|------|
+| `agent_bot` | integer | 否 | AgentBot 的 ID，传 `null` 表示解绑 |
+
+**权限要求**:
+- 需要 `administrator` 角色 (`app/policies/inbox_policy.rb:53-54`)
+
+**绑定机器人 (curl 示例)**:
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/inboxes/5/set_agent_bot \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: ADMIN_AGENT_ACCESS_TOKEN" \
+  -d '{
+    "agent_bot": 1
+  }'
+```
+
+**解绑机器人**:
+```bash
+curl -X POST http://localhost:3000/api/v1/accounts/1/inboxes/5/set_agent_bot \
+  -H "Content-Type: application/json" \
+  -H "api_access_token: ADMIN_AGENT_ACCESS_TOKEN" \
+  -d '{
+    "agent_bot": null
+  }'
+```
+
+**控制器实现逻辑** (`app/controllers/api/v1/accounts/inboxes_controller.rb:58-67`):
 ```ruby
+def set_agent_bot
+  if @agent_bot
+    # 绑定：创建或更新 AgentBotInbox 关联
+    agent_bot_inbox = @inbox.agent_bot_inbox || AgentBotInbox.new(inbox: @inbox)
+    agent_bot_inbox.agent_bot = @agent_bot
+    agent_bot_inbox.save!  # 默认 status = 'active'
+  elsif @inbox.agent_bot_inbox.present?
+    # 解绑：删除关联记录
+    @inbox.agent_bot_inbox.destroy!
+  end
+  head :ok
+end
+```
+
+**Rails 控制台备用方式**:
+```ruby
+account = Account.find(1)
+inbox = account.inboxes.find(5)
+agent_bot = account.agent_bots.find(1)
+
+# 创建关联（status 默认就是 active）
+agent_bot_inbox = AgentBotInbox.create!(
+  inbox: inbox,
+  agent_bot: agent_bot
+)
+
+# 或者：使用 has_one 关联的便捷方式
+inbox.agent_bot = agent_bot
+inbox.save!
+```
+
+**验证绑定状态**:
+```ruby
+# 检查收件箱是否有活跃机器人
 inbox.active_bot?  # => true
+
+# 检查关联状态
 inbox.agent_bot_inbox.status  # => "active"
+inbox.agent_bot.name          # => "My Support Bot"
+
+# 检查关联是否存在
+inbox.agent_bot_inbox.present?  # => true
+```
+
+**解绑后的验证**:
+```ruby
+inbox.agent_bot_inbox.present?  # => false
+inbox.active_bot?               # => false（除非有 Dialogflow 等其他集成）
 ```
 
 **关键代码**:
+- API 控制器: `app/controllers/api/v1/accounts/inboxes_controller.rb:58-67`
+- 权限检查: `app/policies/inbox_policy.rb:53-55`
 - 激活判断: `app/models/inbox.rb:173-176`
 - 关联模型: `app/models/agent_bot_inbox.rb:14-29`
+- 路由定义: `config/routes.rb:231` 附近
 
 #### 12.1.3 准备 Webhook 接收服务
 
