@@ -2,7 +2,7 @@
 
 ## 1. 概览
 
-本文档分析 Chatwoot 中快捷回复（Canned Responses）和宏命令（Macros）在服务端的存储机制、触发流程以及跨多个对话时的执行上下文隔离策略。
+本文档分析 Chatwoot 中快捷回复（Canned Responses）和宏命令（Macros）在服务端的存储机制、触发流程、权限校验以及跨多个对话时的执行上下文隔离策略。
 
 ---
 
@@ -85,6 +85,291 @@ end
 - 快捷回复本质是**纯文本模板**，不包含复杂的业务逻辑
 - 触发是**同步的、前端驱动的**，直接将内容替换到消息输入框
 - **不涉及后台异步任务**，也不跨越多个对话执行
+
+---
+
+### 2.2.3 "服务端仅存取不展开 short_code"的完整反证链路
+
+**命题**：服务端仅存储和检索快捷回复数据，**不负责**根据 `short_code` 展开为 `content`。展开逻辑完全在前端完成。
+
+以下从三个维度提供完整证据链。
+
+---
+
+#### 证据一：控制器参数接收与响应 — 只有 CRUD，无"展开/解析"动作
+
+位置：`app/controllers/api/v1/accounts/canned_responses_controller.rb`
+
+**完整控制器代码分析：**
+
+```ruby
+class Api::V1::Accounts::CannedResponsesController < Api::V1::Accounts::BaseController
+  def index
+    @canned_responses = canned_responses
+  end
+
+  def create
+    @canned_response = Current.account.canned_responses.new(canned_response_params)
+    @canned_response.save!
+    render json: @canned_response
+  end
+
+  def update
+    @canned_response.update!(canned_response_params)
+    render json: @canned_response
+  end
+
+  def destroy
+    @canned_response.destroy!
+    head :ok
+  end
+
+  private
+
+  def canned_response_params
+    params.require(:canned_response).permit(:short_code, :content)
+  end
+
+  def canned_responses
+    if params[:search]
+      Current.account.canned_responses
+             .where('short_code ILIKE :search OR content ILIKE :search', search: "%#{params[:search]}%")
+             .order_by_search(params[:search])
+    else
+      Current.account.canned_responses
+    end
+  end
+end
+```
+
+**分析点：**
+
+| 接口 | 接收参数 | 返回内容 | 是否涉及 "short_code → content" 展开 |
+|------|---------|---------|-----------------------------------|
+| `index` | `search`（可选） | 匹配的 `canned_response` 数组（包含 `short_code` 和 `content` 字段） | **否** — 只是按 search 过滤，返回完整记录 |
+| `create` | `canned_response[short_code]`, `canned_response[content]` | 保存后的记录 | **否** — 只是存储，不做解析 |
+| `update` | 同上 | 更新后的记录 | **否** — 只是更新 |
+| `destroy` | 无 | `head :ok` | **否** — 只是删除 |
+
+**关键观察：**
+- 没有 `expand`、`resolve`、`apply` 之类的额外接口
+- `index` 的 `search` 参数用于**列表过滤**，不是"根据 short_code 找 content"
+- 响应中总是同时返回 `short_code` 和 `content`，由客户端自行选择使用哪个
+
+---
+
+#### 证据二：模型字段存储 — `short_code` 和 `content` 是两个独立字段，服务端只做持久化
+
+位置：`app/models/canned_response.rb`
+
+```ruby
+class CannedResponse < ApplicationRecord
+  validates :content, presence: true
+  validates :short_code, presence: true
+  validates :account, presence: true
+  validates :short_code, uniqueness: { scope: :account_id }
+
+  belongs_to :account
+end
+```
+
+**数据库 schema：**
+
+```ruby
+create_table "canned_responses", force: :cascade do |t|
+  t.integer "account_id", null: false
+  t.string "short_code"
+  t.text "content"
+  t.datetime "created_at", null: false
+  t.datetime "updated_at", null: false
+  t.index ["account_id", "short_code"], unique: true
+end
+```
+
+**分析点：**
+
+| 方面 | 结论 |
+|------|------|
+| **字段独立性** | `short_code` 和 `content` 是两个独立列，没有 `content` 是通过 `short_code` 计算得出的迹象 |
+| **唯一性约束** | `unique: true` 加在 `[account_id, short_code]` 上，保证同一账户内 short_code 唯一，但这是**存储约束**，不是"展开约束" |
+| **模型方法** | 没有任何实例方法或类方法接受 `short_code` 参数并返回对应的 `content` |
+| **回调/钩子** | 没有 `before_save`、`after_find` 等回调处理 short_code 的解析 |
+
+**关键结论：**
+- 服务端将 `short_code` 和 `content` 作为**两个独立数据项**存储
+- 没有任何数据库层面或模型层面的"展开逻辑"
+- 如果服务端要做展开，必然需要一个方法如 `CannedResponse.find_by(short_code: '/greeting').content`，但这个查询由**谁来发起**？后续证据表明发起者不是服务端。
+
+---
+
+#### 证据三：发送消息路径中没有 short_code 解析步骤
+
+这是最关键的反证：**消息从前端发出到服务端存入数据库的完整链路中，没有任何一步解析 short_code 模式。**
+
+##### 3.1 前端发送消息的参数
+
+位置：`app/javascript/dashboard/helper/editorHelper.js`
+
+```javascript
+cannedResponse: (editorView, content, from, to, variables) => {
+  const updatedMessage = replaceVariablesInMessage({
+    message: content,  // ← 这里的 content 已经是展开后的完整消息
+    variables,
+  });
+  const node = createNode(editorView, 'cannedResponse', updatedMessage);
+  return {
+    node,
+    from: node.textContent === updatedMessage ? from : from - 1,
+    to,
+  };
+},
+```
+
+**关键观察：**
+- 插入编辑器时，使用的已经是 `content`（展开后的完整消息）
+- 编辑器中最终显示的是完整文本，不是 `/greeting`
+
+##### 3.2 后端消息接收控制器
+
+位置：`app/controllers/api/v1/accounts/conversations/messages_controller.rb`
+
+```ruby
+def create
+  user = Current.user || @resource
+  mb = Messages::MessageBuilder.new(user, @conversation, params)
+  @message = mb.perform
+rescue StandardError => e
+  render_could_not_create_error(e.message)
+end
+```
+
+**分析：**
+- 直接将 `params` 传给 `Messages::MessageBuilder`
+- 没有对 `params[:content]` 做任何 short_code 模式匹配或替换
+
+##### 3.3 MessageBuilder 消息构建逻辑
+
+位置：`app/builders/messages/message_builder.rb`
+
+```ruby
+def perform
+  @message = @conversation.messages.build(message_params)
+  process_attachments
+  process_emails
+  process_email_content
+  @message.save!
+  @message
+end
+
+def message_params
+  {
+    account_id: @conversation.account_id,
+    inbox_id: @conversation.inbox_id,
+    message_type: message_type,
+    content: @params[:content],  # ← 直接使用传入的 content，不做解析
+    private: @private,
+    sender: sender,
+    content_type: @params[:content_type],
+    content_attributes: content_attributes.presence,
+    items: @items,
+    in_reply_to: @in_reply_to,
+    echo_id: @params[:echo_id],
+    source_id: @params[:source_id]
+  }.merge(external_created_at).merge(automation_rule_id).merge(campaign_id).merge(template_params)
+end
+```
+
+**关键证据：**
+
+```ruby
+content: @params[:content]  # 直接使用，不做任何 short_code → content 的解析
+```
+
+**搜索验证：**
+
+全局搜索 Ruby 代码中是否存在 short_code 解析模式：
+
+```bash
+rg -n "short_code.*content|content.*short_code|expand.*short|resolve.*short" app lib --type ruby
+# 无匹配结果（除了测试和模型定义本身）
+```
+
+全局搜索 JavaScript 代码中是否存在替换逻辑：
+
+```bash
+rg -n "canned.*content|shortCode|short_code" app/javascript
+# 前端有逻辑，但后端完全没有
+```
+
+##### 3.4 完整消息链路对比
+
+**如果服务端展开 short_code，链路应该是：**
+
+```
+用户输入 "/greeting"
+    ↓
+前端发送 { content: "/greeting" }
+    ↓
+后端 messages#create 接收
+    ↓
+后端查找 CannedResponse.find_by(short_code: "/greeting")
+    ↓
+后端替换 content 为 "Hello! How can I help you?"
+    ↓
+存入数据库
+```
+
+**但实际链路是：**
+
+```
+用户输入 "/greet"
+    ↓
+前端拦截 "/" 前缀
+    ↓
+前端调用 GET /canned_responses?search=greet
+    ↓
+后端返回 [{ short_code: "/greeting", content: "Hello! ..." }]
+    ↓
+前端展示列表
+    ↓
+用户选择某一项
+    ↓
+前端将 content 直接插入编辑器
+    ↓
+用户发送消息
+    ↓
+前端发送 { content: "Hello! How can I help you?" }
+    ↓
+后端 messages#create 接收
+    ↓
+后端直接存入数据库（不做任何解析）
+```
+
+**关键差异：**
+
+| 步骤 | 假设的"服务端展开" | 实际行为 |
+|------|------------------|---------|
+| 发送到后端的 `content` | `/greeting` | `"Hello! How can I help you?"` |
+| 后端是否需要 `canned_responses` 表参与消息创建 | 是 | **否** |
+| `Messages::MessageBuilder` 是否处理 short_code | 是 | **否** |
+| 短代码在哪个阶段被"消失" | 后端 | **前端（插入编辑器时）** |
+
+---
+
+#### 结论：服务端仅做存取，不参与展开
+
+| 证据维度 | 结论 |
+|---------|------|
+| 控制器接口 | 只有 CRUD + 搜索，没有 `expand/apply/resolve` |
+| 参数接收 | `canned_response_params` 只接收 `short_code` 和 `content`，不接收需要解析的消息 |
+| 消息创建路径 | `messages#create` → `MessageBuilder` 直接使用 `params[:content]`，不做任何 short_code 解析 |
+| 全局搜索验证 | Ruby 代码中没有 short_code → content 的替换逻辑 |
+| 前端代码 | 前端 `CannedResponse.vue` 和 `editorHelper.js` 明确展示了完整的展开流程 |
+
+**一句话总结：**
+> 服务端的 `canned_responses` 表只是一个**键值存储**（key: short_code, value: content）。
+> 这个存储的读取由前端在**消息发送之前**完成，然后前端直接把展开后的 `content` 发给消息创建接口。
+> 消息创建接口完全不知道 `short_code` 的存在，它只处理已展开的文本。
 
 ---
 
@@ -254,7 +539,7 @@ end
 
 ---
 
-### 3.1.6 执行前的完整校验链路
+### 3.1.6 执行前的完整校验链路与权限失败路径
 
 位置：`app/controllers/api/v1/accounts/macros_controller.rb`
 
@@ -276,35 +561,295 @@ def execute
 end
 ```
 
-**完整执行校验链路：**
+---
+
+#### 3.1.6.1 三层校验的顺序与条件
 
 ```
-POST /macros/:id/execute
-    ↓
-1. fetch_macro: Current.account.macros.find_by(id: params[:id])
-   ├── 限制在 Current.account 内查询（租户隔离）
-   └── 找不到返回 nil，后续 authorize 不报错但 @macro 为 nil
-    ↓
-2. check_authorization: authorize(@macro) if @macro.present?
-   └── 调用 MacroPolicy#execute?
-       ├── global? → true（全局宏任何人可执行）
-       └── author? → created_by == current_user（个人宏仅作者可执行）
-    ↓
-3. 若授权通过
-   └── MacrosExecutionJob.perform_later(@macro, conversation_ids, Current.user)
-    ↓
-4. MacrosExecutionJob#perform
-   └── account.conversations.where(display_id: conversation_ids)
-       └── 二次验证对话属于同一账户
+POST /api/v1/accounts/:account_id/macros/:id/execute
+    │
+    ▼
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第 1 层：fetch_macro (租户级查询限制)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+查询逻辑：Current.account.macros.find_by(id: params[:id])
+    │
+    ├─ 宏存在 且 属于 Current.account ──→ @macro = 宏对象
+    │
+    └─ 宏不存在 OR 属于其他账户 ──→ @macro = nil
+              │
+              ▼
+              后续 check_authorization 中：
+              authorize(@macro) if @macro.present?
+              因为 @macro = nil，所以 authorize 被跳过
+              直接进入 execute action
+              │
+              ▼
+              execute 中：
+              MacrosExecutionJob.perform_later(nil, conversation_ids, user)
+              │
+              ▼
+              Rails 会尝试序列化 nil 到队列
+              实际执行时会出错（见下文详细分析）
 ```
 
-**三层校验保障：**
+```
+    │
+    ▼ (假设 @macro 存在)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第 2 层：check_authorization (Pundit 权限校验)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+调用：authorize(@macro)
+    │
+    ├─ @macro.global? = true ──→ 任何用户都可执行
+    │
+    ├─ @macro.personal? 且 @macro.created_by == Current.user ──→ 仅作者可执行
+    │
+    └─ @macro.personal? 且 不是作者 ──→ 抛出 Pundit::NotAuthorizedError
+              │
+              ▼
+              ApplicationController 中的异常处理：
+              include Pundit::Authorization
+              include RequestExceptionHandler
+              │
+              ▼
+              RequestExceptionHandler 中：
+              rescue Pundit::NotAuthorizedError => e
+                log_handled_error(e)
+                render_unauthorized('You are not authorized to do this action')
+              ensure
+                Current.reset
+              end
+              │
+              ▼
+              HTTP 401 Unauthorized
+              Body: { "error": "You are not authorized to do this action" }
+```
 
-| 层次 | 校验点 | 代码位置 | 失败表现 |
-|------|--------|---------|---------|
-| 第1层 | 租户级查询限制 | `Current.account.macros.find_by` | @macro = nil，不执行 |
-| 第2层 | Pundit 权限校验 | `MacroPolicy#execute?` | 抛出 Pundit::NotAuthorizedError → 403 |
-| 第3层 | 对话归属验证 | `account.conversations.where` | 不在同一账户的对话被过滤 |
+```
+    │
+    ▼ (假设通过了前两层)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+第 3 层：execute 入队 + MacrosExecutionJob 对话验证
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Controller:
+  MacrosExecutionJob.perform_later(@macro, conversation_ids: params[:conversation_ids], user: Current.user)
+  head :ok
+    │
+    ▼ (异步任务在 Sidekiq 中执行)
+MacrosExecutionJob#perform(macro, conversation_ids:, user:)
+  account = macro.account
+  conversations = account.conversations.where(display_id: conversation_ids.to_a)
+    │
+    ├─ 所有 conversation_ids 都属于 macro.account
+    │   └─ conversations = 匹配的对话集合
+    │       └─ 执行每个对话
+    │
+    ├─ 部分 conversation_ids 属于其他账户
+    │   └─ conversations = 只包含属于 macro.account 的对话
+    │       └─ 其他对话被静默过滤，无任何报错
+    │
+    └─ 所有 conversation_ids 都不属于 macro.account (或无效 ID)
+        └─ conversations = [] (empty)
+            └─ return if conversations.blank?
+            └─ 任务静默结束，不执行任何操作
+```
+
+---
+
+#### 3.1.6.2 三种失败场景的详细分析
+
+**场景 A：@macro 不存在（或跨租户）**
+
+| 项目 | 值 |
+|------|-----|
+| **触发条件** | `params[:id]` 不存在，或该宏属于其他 `account_id` |
+| **第 1 层结果** | `@macro = nil` |
+| **第 2 层结果** | `check_authorization` 中 `@macro.present?` 为 `false`，跳过 `authorize` |
+| **第 3 层结果** | `execute` 调用 `MacrosExecutionJob.perform_later(nil, ...)` |
+| **HTTP 响应** | `head :ok` → **200 OK** |
+| **实际执行** | **任务入队时传 nil，执行时可能出错或静默失败** |
+
+**代码级分析：**
+
+```ruby
+# macros_controller.rb
+def fetch_macro
+  @macro = Current.account.macros.find_by(id: params[:id])  # find_by 返回 nil，不抛异常
+end
+
+def check_authorization
+  authorize(@macro) if @macro.present?  # @macro = nil，不执行 authorize
+end
+
+def execute
+  ::MacrosExecutionJob.perform_later(@macro, conversation_ids: params[:conversation_ids], user: Current.user)
+  head :ok  # 立即返回 200
+end
+```
+
+```ruby
+# macros_execution_job.rb
+def perform(macro, conversation_ids:, user:)
+  account = macro.account  # macro = nil → NoMethodError: undefined method `account' for nil:NilClass
+  # ...
+end
+```
+
+**最终表现：**
+- 前端收到 HTTP **200 OK**（因为 controller 先返回了）
+- Sidekiq 任务执行时抛出 `NoMethodError`
+- 任务可能被重试或丢弃（取决于 Sidekiq 配置）
+- **这是一个潜在的 bug：宏不存在时不应该返回 200**
+
+---
+
+**场景 B：Pundit 未授权（个人宏但非作者）**
+
+| 项目 | 值 |
+|------|-----|
+| **触发条件** | 宏存在且是 `personal`，但 `created_by != Current.user` |
+| **第 1 层结果** | `@macro = 宏对象` |
+| **第 2 层结果** | `MacroPolicy#execute?` 返回 `false` |
+| **第 3 层结果** | `execute` action **根本不执行** |
+| **HTTP 响应** | **401 Unauthorized**（由 `RequestExceptionHandler` 处理） |
+| **实际执行** | **任务未入队，完全不执行** |
+
+**异常处理链路：**
+
+位置：`app/controllers/concerns/request_exception_handler.rb`
+
+```ruby
+module RequestExceptionHandler
+  extend ActiveSupport::Concern
+
+  included do
+    rescue_from ActiveRecord::RecordInvalid, with: :render_record_invalid
+  end
+
+  private
+
+  def handle_with_exception
+    yield
+  rescue ActiveRecord::RecordNotFound => e
+    log_handled_error(e)
+    render_not_found_error('Resource could not be found')
+  rescue Pundit::NotAuthorizedError => e
+    log_handled_error(e)
+    render_unauthorized('You are not authorized to do this action')
+  rescue ActionController::ParameterMissing => e
+    log_handled_error(e)
+    render_could_not_create_error(e.message)
+  ensure
+    Current.reset
+  end
+
+  def render_unauthorized(message)
+    render json: { error: message }, status: :unauthorized  # ← 返回 401
+  end
+end
+```
+
+注意：`rescue_from Pundit::NotAuthorizedError` 不在 `included do` 块中，而是在 `handle_with_exception` 方法内。这意味着只有使用 `handle_with_exception` 包裹的代码才会捕获 Pundit 异常。
+
+**但 MacrosController 是标准的 Rails 控制器 + Pundit：**
+
+位置：`app/controllers/application_controller.rb`
+
+```ruby
+class ApplicationController < ActionController::Base
+  include DeviseTokenAuth::Concerns::SetUserByToken
+  include RequestExceptionHandler
+  include Pundit::Authorization  # ← Pundit 的默认行为是抛出异常后由 Rails 处理
+  # ...
+end
+```
+
+Pundit 的 `authorize` 方法抛出 `Pundit::NotAuthorizedError` 后，Rails 默认会返回 **403 Forbidden**。但 `RequestExceptionHandler` 中有 `handle_with_exception` 方法可以返回 401。
+
+**实际行为取决于是否使用了 `handle_with_exception` 包裹。** 从代码看，`macros_controller.rb` 的 `execute` 方法是直接执行，没有 `handle_with_exception` 包裹。
+
+**修正后的场景 B 结论：**
+
+| 项目 | 值 |
+|------|-----|
+| **HTTP 响应** | **403 Forbidden**（Pundit 默认行为） |
+| **Body** | 取决于 Rails 的异常处理配置 |
+
+---
+
+**场景 C：conversation_ids 跨租户或无效**
+
+| 项目 | 值 |
+|------|-----|
+| **触发条件** | 宏存在且授权通过，但 `conversation_ids` 包含不属于 `macro.account` 的 ID，或不存在的 ID |
+| **第 1 层结果** | `@macro = 宏对象` |
+| **第 2 层结果** | 授权通过 |
+| **第 3 层结果** | `MacrosExecutionJob` 中过滤对话 |
+| **HTTP 响应** | **200 OK** |
+| **实际执行** | **取决于过滤后的 conversations 是否为空** |
+
+**代码级分析：**
+
+```ruby
+# macros_execution_job.rb
+def perform(macro, conversation_ids:, user:)
+  account = macro.account
+  # WHERE display_id IN (conversation_ids) 只返回属于这个 account 的对话
+  conversations = account.conversations.where(display_id: conversation_ids.to_a)
+
+  return if conversations.blank?  # 如果所有 ID 都无效/跨租户，直接返回
+
+  conversations.each do |conversation|
+    ::Macros::ExecutionService.new(macro, conversation, user).perform
+  end
+end
+```
+
+**细分情况：**
+
+| conversation_ids 内容 | 过滤后的 conversations | 执行结果 |
+|----------------------|---------------------|---------|
+| `[1, 2, 3]` 都有效且属于同一账户 | `[Conv1, Conv2, Conv3]` | 3 个对话都执行 |
+| `[1, 2]` 有效，`[999]` 不存在 | `[Conv1, Conv2]` | 2 个对话执行，999 被静默忽略 |
+| `[1]` 属于当前账户，`[2]` 属于其他账户 | `[Conv1]` | 1 个对话执行，跨租户的 2 被静默过滤 |
+| `[999, 888]` 都不存在 | `[]` | 任务静默结束，不执行任何操作 |
+| `[3]` 属于其他账户 | `[]` | 任务静默结束 |
+
+**关键特性：**
+- 没有任何报错，也没有返回"部分成功/部分失败"的指示
+- 前端收到 200 后无法知道实际执行了多少个对话
+- 跨租户的对话 ID 被静默过滤（安全但不够可观测）
+
+---
+
+#### 3.1.6.3 三种失败场景汇总表
+
+| 失败场景 | HTTP 状态码 | 是否入队 | 实际执行 | 错误反馈 |
+|---------|------------|---------|---------|---------|
+| **A. @macro 不存在/跨租户** | **200 OK** | **是**（但传 nil） | Sidekiq 任务执行时抛出 `NoMethodError` | **前端无反馈**（潜在 bug） |
+| **B. Pundit 未授权** | **403 Forbidden** | **否** | 任务未入队，完全不执行 | **有明确反馈**（Pundit 异常） |
+| **C. conversation_ids 无效/跨租户** | **200 OK** | **是** | 过滤后为空则不执行，部分有效则执行有效部分 | **前端无反馈**（静默忽略） |
+
+**问题代码定位：**
+
+```ruby
+# 问题 1：fetch_macro 使用 find_by，失败时返回 nil 而不是抛异常
+def fetch_macro
+  @macro = Current.account.macros.find_by(id: params[:id])  # 应该用 find! 并在异常处理中返回 404
+end
+
+# 问题 2：check_authorization 在 @macro 为 nil 时跳过
+def check_authorization
+  authorize(@macro) if @macro.present?  # 导致场景 A 绕过权限校验
+end
+
+# 问题 3：conversation_ids 过滤后没有任何反馈
+conversations = account.conversations.where(display_id: conversation_ids.to_a)
+return if conversations.blank?  # 静默返回，前端不知道发生了什么
+```
+
+---
 
 ### 3.2 支持的动作类型
 
@@ -583,6 +1128,200 @@ end
 2. 对话2 开始时重新设置 `Current.user`
 3. 对话间的 `Current` 状态完全隔离
 
+---
+
+### 4.3.4 两层隔离边界的细分
+
+宏执行时存在**两个层次**的隔离：**线程级隔离**和**对话实例级隔离**。
+
+#### 线程级隔离（Thread-Level Isolation）
+
+**基础机制**：
+位置：`lib/current.rb`
+
+```ruby
+module Current
+  thread_mattr_accessor :user
+  thread_mattr_accessor :account
+  thread_mattr_accessor :account_user
+  thread_mattr_accessor :executed_by
+  thread_mattr_accessor :contact
+end
+```
+
+**线程级隔离的是：**
+
+| Current 变量 | 说明 | 何时使用 |
+|-------------|------|---------|
+| `Current.user` | 当前操作用户 | 模型回调、审计日志、消息发送者 |
+| `Current.account` | 当前账户 | 租户隔离、权限校验 |
+| `Current.account_user` | 用户-账户关联 | 角色判断（admin/agent） |
+| `Current.executed_by` | 执行者标识 | 特殊操作追踪 |
+| `Current.contact` | 当前联系人 | 联系人相关操作 |
+
+**线程级隔离的保证：**
+
+1. **线程本地存储（TLS）**：使用 `thread_mattr_accessor`，数据绑定到 `Thread.current`
+2. **不同线程天然隔离**：Sidekiq  worker 线程、Web 请求线程各有独立副本
+3. **同一线程内的时序隔离**：通过 `Current.reset` 在每次执行前后清理
+
+**场景分析：**
+
+```
+Sidekiq 进程（多线程）
+├── Thread 1: 执行 Job A (用户 A 的宏)
+│   └── Current.user = User_A  ← 只在 Thread 1 可见
+│
+├── Thread 2: 执行 Job B (用户 B 的宏)
+│   └── Current.user = User_B  ← 只在 Thread 2 可见，与 Thread 1 无关
+│
+└── Thread 3: 执行 Job C (批量处理 10 个对话)
+    ├── 对话 1: Current.user = User_C → 执行 → Current.reset
+    ├── 对话 2: Current.user = User_C → 执行 → Current.reset
+    └── ...
+```
+
+**线程级隔离不解决的问题：**
+- 同一线程内顺序执行多个对话时，`Current` 变量可能被前一个对话"污染"
+- 需要配合对话实例级隔离
+
+---
+
+#### 对话实例级隔离（Conversation-Instance Level Isolation）
+
+**基础机制**：`MacrosExecutionJob` 对每个对话创建独立的 `ExecutionService` 实例。
+
+位置：`app/jobs/macros_execution_job.rb`
+
+```ruby
+conversations.each do |conversation|
+  ::Macros::ExecutionService.new(macro, conversation, user).perform
+end
+```
+
+**对话实例级隔离的是：**
+
+| 实例变量 | 所属 | 隔离作用 |
+|---------|------|---------|
+| `@conversation` | `ActionService` | 每个实例独立的对话对象 |
+| `@account` | `Macros::ExecutionService` | 虽然同属一账户，但通过实例变量访问 |
+| `@user` | `Macros::ExecutionService` | 执行用户（同一宏通常相同） |
+| `@macro` | `Macros::ExecutionService` | 宏定义（只读，各实例共享同一个对象引用） |
+
+**对话实例级隔离的保证：**
+
+1. **对象隔离**：每个对话有独立的 `Conversation` 模型实例
+2. **reload 策略**：`ActionService.initialize` 中调用 `@conversation.reload`，确保读取最新状态
+3. **异常隔离**：单个对话执行失败不影响其他对话
+
+**场景分析：**
+
+```
+同一线程内，批量执行对话 A、B、C
+
+┌─────────────────────────────────────────────────────────────┐
+│  Thread.current                                              │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  对话 A                                              │    │
+│  │  ┌─────────────────────────────────────────────┐    │    │
+│  │  │  ExecutionService#1                          │    │    │
+│  │  │  @conversation = Conversation_A             │    │    │
+│  │  │  @user = User_X                             │    │    │
+│  │  │  Current.user = User_X (TLS)                │    │    │
+│  │  │    ↓                                        │    │    │
+│  │  │  执行动作 → 修改 Conversation_A             │    │    │
+│  │  │    ↓                                        │    │    │
+│  │  │  ensure: Current.reset                      │    │    │
+│  │  └─────────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                           ↓                                  │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │  对话 B (独立实例，与 A 无状态共享)                   │    │
+│  │  ┌─────────────────────────────────────────────┐    │    │
+│  │  │  ExecutionService#2                          │    │    │
+│  │  │  @conversation = Conversation_B             │    │    │
+│  │  │  @user = User_X                             │    │    │
+│  │  │  Current.user = User_X (TLS，重置后重新设置) │    │    │
+│  │  │    ↓                                        │    │    │
+│  │  │  执行动作 → 修改 Conversation_B             │    │    │
+│  │  └─────────────────────────────────────────────┘    │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**关键隔离点：**
+
+```ruby
+# 每次调用 new 都是新实例
+service1 = Macros::ExecutionService.new(macro, conversation_A, user)
+service2 = Macros::ExecutionService.new(macro, conversation_B, user)
+
+# service1 和 service2 的 @conversation 不同
+service1.instance_variable_get(:@conversation)  # => Conversation_A
+service2.instance_variable_get(:@conversation)  # => Conversation_B
+
+# 但 @macro 是同一个对象引用（只读，不影响隔离）
+service1.instance_variable_get(:@macro).object_id == service2.instance_variable_get(:@macro).object_id
+# => true（共享同一宏对象，但宏是只读的）
+```
+
+---
+
+#### 两层隔离的协作关系
+
+```
+                    线程级隔离
+                    (Thread Local Storage)
+                    │
+                    ├── 不同线程: 天然隔离 (Sidekiq 多 worker)
+                    │
+                    └── 同一线程: 需要时序隔离
+                           │
+                           └── 通过对话实例级隔离实现
+                                │
+                                ├── 每个对话独立 ExecutionService 实例
+                                ├── 每个实例独立的 @conversation
+                                ├── 每次 new() 时设置 Current.user
+                                └── 每次 ensure 块中 Current.reset
+```
+
+**隔离边界对比表：**
+
+| 维度 | 线程级隔离 | 对话实例级隔离 |
+|------|-----------|---------------|
+| **实现机制** | `thread_mattr_accessor` | 每次循环创建新 `ExecutionService` 对象 |
+| **隔离对象** | `Current.*` 全局上下文 | `@conversation`、`@account`、`@user` 等实例变量 |
+| **跨线程** | 天然隔离 | 无关（对象在各自线程栈） |
+| **同线程跨对话** | 需要 `Current.reset` 配合 | 天然隔离（不同对象实例） |
+| **Rails 模型** | 全局依赖（模型回调读取 `Current.user`） | 局部依赖（通过参数传入） |
+| **隔离失败后果** | 用户上下文泄漏，A 的操作被记为 B 执行 | 可能污染前一个对话的对象状态（但有 reload 防护） |
+
+**reload 机制的关键作用：**
+
+位置：`app/services/action_service.rb`
+
+```ruby
+def initialize(conversation)
+  @conversation = conversation.reload  # ← 关键：确保获取最新状态
+  @account = @conversation.account
+end
+```
+
+位置：`app/services/macros/execution_service.rb`
+
+```ruby
+def send_message(message)
+  # ...
+  mb = Messages::MessageBuilder.new(@user, @conversation.reload, params)  # ← 执行前再次 reload
+  mb.perform
+end
+```
+
+即使 `@conversation` 对象实例被"污染"（例如同一线程前一个对话的对象残留），通过 `reload` 也能确保从数据库读取最新状态。
+
+---
+
 ### 4.4 为什么需要 Current 模块？
 
 虽然 `ExecutionService` 已经通过实例变量持有 `@user`，但系统中许多其他组件依赖 `Current.user`：
@@ -653,7 +1392,191 @@ end
 | **动作白名单** | `ACTIONS_ATTRS` 限制可执行的动作类型 |
 | **异常隔离** | 单个动作的异常被捕获，不中断整个宏执行 |
 
-### 5.4 数据流图示
+---
+
+### 5.4 "执行前校验" vs "执行中隔离" — 边界总结
+
+在分析宏命令的安全机制时，容易混淆两个独立层次：**执行前的权限校验**和**执行中的上下文隔离**。这两者目的不同、位置不同、失败后果也不同。
+
+---
+
+#### 5.4.1 执行前校验（Pre-Execution Validation）
+
+**定义**：在宏**真正开始执行之前**，对"谁可以执行什么"进行的检查。
+
+**层次结构：**
+
+```
+                    ┌─────────────────────────────────────┐
+                    │       执行前校验层                     │
+                    │                                     │
+                    │  目的：防止非法操作的发起             │
+                    │                                     │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 1. 租户级查询限制           │    │
+                    │  │    Current.account.macros   │    │
+                    │  │    find_by(id)              │    │
+                    │  └─────────────────────────────┘    │
+                    │              │                      │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 2. Pundit 权限校验          │    │
+                    │  │    MacroPolicy#execute?     │    │
+                    │  │    global? || author?       │    │
+                    │  └─────────────────────────────┘    │
+                    │              │                      │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 3. 对话归属验证             │    │
+                    │  │    account.conversations    │    │
+                    │  │    where(display_id: ...)   │    │
+                    │  └─────────────────────────────┘    │
+                    └─────────────────────────────────────┘
+```
+
+**执行前校验的特点：**
+
+| 特性 | 说明 |
+|------|------|
+| **时机** | 任务入队前（第 1、2 层）或 Job 执行初期（第 3 层） |
+| **目标** | 回答"这个操作**是否应该被允许**" |
+| **失败后果** | 任务不执行（或部分不执行），返回错误或静默 |
+| **典型问题** | 权限不足、跨租户访问、资源不存在 |
+
+**三种失败路径回顾：**
+
+| 校验层 | 校验失败时 | 宏是否执行 |
+|--------|-----------|-----------|
+| 租户级查询（`@macro` 为 nil） | 返回 200 但传 nil 给 Job | **Sidekiq 执行时报错**（潜在 bug） |
+| Pundit 权限校验 | 返回 403 Forbidden | **完全不执行** |
+| 对话归属验证 | 过滤掉无效/跨租户 ID | **部分执行或不执行**（静默） |
+
+---
+
+#### 5.4.2 执行中隔离（Execution-Time Isolation）
+
+**定义**：在校验通过、宏**真正开始执行**后，确保不同对话、不同线程之间的状态不互相污染。
+
+**层次结构：**
+
+```
+                    ┌─────────────────────────────────────┐
+                    │       执行中隔离层                     │
+                    │                                     │
+                    │  目的：防止已授权操作之间的污染       │
+                    │                                     │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 1. 线程级隔离               │    │
+                    │  │    thread_mattr_accessor    │    │
+                    │  │    Current.* (TLS)          │    │
+                    │  └─────────────────────────────┘    │
+                    │              │                      │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 2. 对话实例级隔离           │    │
+                    │  │    每个对话独立              │    │
+                    │  │    ExecutionService 实例    │    │
+                    │  └─────────────────────────────┘    │
+                    │              │                      │
+                    │  ┌─────────────────────────────┐    │
+                    │  │ 3. 对象 reload 防护         │    │
+                    │  │    @conversation.reload     │    │
+                    │  │    确保读取最新状态          │    │
+                    │  └─────────────────────────────┘    │
+                    └─────────────────────────────────────┘
+```
+
+**执行中隔离的特点：**
+
+| 特性 | 说明 |
+|------|------|
+| **时机** | 在校验通过后，`Macros::ExecutionService#perform` 执行期间 |
+| **目标** | 回答"这些已授权的操作**如何互不干扰**" |
+| **失败后果** | 上下文泄漏（A 的操作被记为 B 执行）、对象状态污染 |
+| **典型问题** | 忘记 `Current.reset`、同一线程内时序问题 |
+
+**两种隔离维度回顾：**
+
+| 维度 | 隔离对象 | 关键机制 |
+|------|---------|---------|
+| 线程级 | `Current.user`, `Current.account` 等全局上下文 | `thread_mattr_accessor` + `Current.reset` |
+| 对话实例级 | `@conversation`, `@user` 等实例变量 | 每次 `new()` 创建独立实例 + `reload` |
+
+---
+
+#### 5.4.3 两层边界的明确划分
+
+```
+                    ┌─────────────────────────────────────────┐
+                    │           请求生命周期                     │
+                    │                                         │
+                    │  ┌─────────────────────────────────┐    │
+                    │  │                                 │    │
+                    │  │   [执行前校验层]                  │    │
+                    │  │                                 │    │
+                    │  │   1. fetch_macro                │    │
+                    │  │      @macro = Current.account   │    │
+                    │  │         .macros.find_by(id)     │    │
+                    │  │                                 │    │
+                    │  │   2. check_authorization        │    │
+                    │  │      MacroPolicy#execute?       │    │
+                    │  │                                 │    │
+                    │  └───────────────┬─────────────────┘    │
+                    │                  │                        │
+                    │        ✓ 校验通过 │ ✗ 校验失败            │
+                    │                  │                        │
+                    │                  ▼                        │
+                    │  ┌─────────────────────────────────┐    │
+                    │  │   [执行中隔离层]                  │    │
+                    │  │                                 │    │
+                    │  │   (只有校验通过后才进入)          │    │
+                    │  │                                 │    │
+                    │  │   3. MacrosExecutionJob         │    │
+                    │  │      对话归属过滤                │    │
+                    │  │                                 │    │
+                    │  │   4. ExecutionService           │    │
+                    │  │      - 线程级隔离 (Current.*)    │    │
+                    │  │      - 实例级隔离 (@conversation)│    │
+                    │  │      - reload 防护               │    │
+                    │  │                                 │    │
+                    │  └─────────────────────────────────┘    │
+                    │                                         │
+                    └─────────────────────────────────────────┘
+```
+
+**混淆时可能产生的错误理解：**
+
+❌ **错误理解 1**："上下文隔离可以防止未授权用户执行宏"
+- **纠正**：上下文隔离是**执行中**的机制，不负责权限校验。
+- 权限校验由**执行前**的 Pundit 负责。
+- 如果一个恶意用户已经绕过了 Pundit（例如通过 bug），上下文隔离无法阻止他的操作。
+
+❌ **错误理解 2**："Pundit 校验失败后，Current 上下文可能泄漏"
+- **纠正**：Pundit 校验在 `before_action` 中执行，此时 `Macros::ExecutionService` 还没有被实例化。
+- `Current.user` 可能在请求开始时被设置（`set_current_user`），但请求结束时 `ensure` 块会清理。
+- 上下文泄漏的风险主要在**执行中**，不是**执行前校验失败**时。
+
+❌ **错误理解 3**："@macro 不存在时返回 200 是隔离问题"
+- **纠正**：这是**执行前校验层**的 bug（`find_by` 返回 nil 而不是抛异常），与隔离无关。
+- 隔离层关注的是"已授权操作之间的污染"，不是"操作是否应该被执行"。
+
+---
+
+#### 5.4.4 边界总结表
+
+| 维度 | 执行前校验 | 执行中隔离 |
+|------|-----------|-----------|
+| **核心问题** | "这个操作**是否允许**？" | "这些操作**如何互不干扰**？" |
+| **时机** | 执行之前（或刚开始） | 执行过程中 |
+| **关键组件** | `fetch_macro`, `authorize`, `account.conversations.where` | `thread_mattr_accessor`, `Current.reset`, `new()`, `reload` |
+| **失败模式** | 拒绝执行、返回错误、静默过滤 | 上下文泄漏、对象污染、数据不一致 |
+| **用户可感知** | 是（403、200 但无效果） | 否（隐蔽 bug，审计日志错误等） |
+| **与业务逻辑关系** | 直接关联（可见性规则、权限矩阵） | 间接关联（基础设施层） |
+
+**一句话总结：**
+> **执行前校验**是"守门员"，决定让不让进；
+> **执行中隔离**是"隔间墙"，保证进来后各自在自己的位置上操作。
+
+---
+
+### 5.5 数据流图示
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -726,6 +1649,8 @@ end
 | `app/services/macros/execution_service.rb` | 宏执行服务（核心） |
 | `app/services/action_service.rb` | 基础动作服务 |
 | `lib/current.rb` | 线程上下文存储模块 |
+| `app/policies/macro_policy.rb` | 宏权限策略（Pundit） |
+| `app/controllers/concerns/request_exception_handler.rb` | 异常处理（含 Pundit） |
 
 ### 6.2 前端实现
 
@@ -735,6 +1660,7 @@ end
 | `app/javascript/dashboard/routes/dashboard/conversation/Macros/MacroItem.vue` | 宏执行组件 |
 | `app/javascript/dashboard/api/macros.js` | 宏 API 调用封装 |
 | `app/javascript/dashboard/store/modules/macros.js` | 宏 Vuex store |
+| `app/javascript/dashboard/helper/editorHelper.js` | 编辑器辅助（含快捷回复插入） |
 
 ### 6.3 数据库
 
