@@ -1,0 +1,605 @@
+# Chatwoot 满意度调查 (CSAT) 完整流程分析
+
+## 概述
+
+本文档详细分析 Chatwoot 中满意度调查（CSAT）的生成、发送、客户提交评价以及跨域回调写回系统的完整技术流程。
+
+---
+
+## 一、CSAT 链接的生成与发送
+
+### 1.1 触发时机
+
+CSAT 调查在对话被标记为"已解决"（resolved）时触发：
+
+**监听器**：`app/listeners/csat_survey_listener.rb:1-15`
+
+```ruby
+class CsatSurveyListener < BaseListener
+  def conversation_status_changed(event)
+    conversation = extract_conversation_and_account(event)[0]
+    return unless conversation.resolved?
+    CsatSurveyService.new(conversation: conversation).perform
+  end
+  
+  def message_updated(event)
+    message = extract_message_and_account(event)[0]
+    return unless message.input_csat?
+    CsatSurveys::ResponseBuilder.new(message: message).perform
+  end
+end
+```
+
+**事件订阅**：监听 `conversation_status_changed` 事件，当对话状态变为 `resolved` 时触发 CSAT 发送流程。
+
+---
+
+### 1.2 CSAT 发送条件检查
+
+**服务类**：`app/services/csat_survey_service.rb:1-180`
+
+CSAT 发送需要满足以下条件：
+
+1. **对话允许 CSAT**：对话已解决且不是 Twitter 推文
+   ```ruby
+   def conversation_allows_csat?
+     conversation.resolved? && !conversation.tweet?
+   end
+   ```
+
+2. **Inbox 已启用 CSAT**：
+   ```ruby
+   def csat_enabled?
+     inbox.csat_survey_enabled?
+   end
+   ```
+
+3. **CSAT 尚未发送**：
+   ```ruby
+   def csat_already_sent?
+     conversation.messages.where(content_type: :input_csat).present?
+   end
+   ```
+
+4. **符合调查规则**（可选）：
+   ```ruby
+   def csat_allowed_by_survey_rules?
+     return true unless survey_rules_configured?
+     labels = conversation.label_list
+     return true if rule_values.empty?
+     case rule_operator
+     when 'contains'
+       rule_values.any? { |label| labels.include?(label) }
+     when 'does_not_contain'
+       rule_values.none? { |label| labels.include?(label) }
+     else
+       true
+     end
+   end
+   ```
+
+---
+
+### 1.3 CSAT 发送策略
+
+根据渠道类型选择不同的发送方式：
+
+| 场景 | 发送方式 |
+|------|---------|
+| WhatsApp 渠道 + 已审批模板 | 发送 WhatsApp 模板消息 |
+| Twilio WhatsApp + 已审批模板 | 发送 Twilio 模板消息 |
+| 在消息窗口内（可回复） | 发送普通消息模板 |
+| 超出消息窗口 | 创建活动消息记录（不实际发送） |
+
+**普通消息模板创建**：`app/services/message_templates/template/csat_survey.rb:1-40`
+
+```ruby
+class MessageTemplates::Template::CsatSurvey
+  def perform
+    ActiveRecord::Base.transaction do
+      conversation.messages.create!(csat_survey_message_params)
+    end
+  end
+  
+  private
+  
+  def csat_survey_message_params
+    {
+      account_id: @conversation.account_id,
+      inbox_id: @conversation.inbox_id,
+      message_type: :template,
+      content_type: :input_csat,  # 关键标识
+      content: message_content,
+      content_attributes: content_attributes
+    }
+  end
+  
+  def content_attributes
+    {
+      display_type: csat_config['display_type'] || 'emoji'  # emoji 或 star
+    }
+  end
+end
+```
+
+---
+
+### 1.4 WhatsApp 模板发送
+
+**WhatsApp 官方渠道**：`app/services/csat_survey_service.rb:107-135`
+
+```ruby
+def send_whatsapp_template_survey
+  template_config = inbox.csat_config&.dig('template')
+  template_name = template_config['name'] || CsatTemplateNameService.csat_template_name(inbox.id)
+  phone_number = conversation.contact_inbox.source_id
+  template_info = build_template_info(template_name, template_config)
+  message = build_csat_message
+  message_id = inbox.channel.provider_service.send_template(phone_number, template_info, message)
+  message.update!(source_id: message_id) if message_id.present?
+end
+
+def build_template_info(template_name, template_config)
+  {
+    name: template_name,
+    lang_code: template_config['language'] || 'en',
+    parameters: [
+      {
+        type: 'button',
+        sub_type: 'url',
+        index: '0',
+        parameters: [{ type: 'text', text: conversation.uuid }]  # 传入对话 UUID
+      }
+    ]
+  }
+end
+```
+
+---
+
+## 二、CSAT 评价表单展示
+
+### 2.1 前端组件结构
+
+**消息气泡组件**：`app/javascript/widget/components/AgentMessageBubble.vue:61-150`
+
+```javascript
+isCSAT() {
+  return this.contentType === 'input_csat';
+}
+
+// 渲染 CSAT 组件
+<CustomerSatisfaction
+  v-if="isCSAT"
+  :message-content-attributes="messageContentAttributes.submitted_values"
+  :display-type="messageContentAttributes.display_type"
+  :message="message"
+  :message-id="messageId"
+/>
+```
+
+### 2.2 CSAT 评价组件
+
+**核心组件**：`app/javascript/shared/components/CustomerSatisfaction.vue:1-209`
+
+组件特性：
+- 支持两种显示方式：emoji（表情）和 star（星级）
+- 评分范围：1-5
+- 可选反馈消息输入
+- 提交后显示已提交状态
+
+```javascript
+methods: {
+  async onSubmit() {
+    this.isUpdating = true;
+    try {
+      await this.$store.dispatch('message/update', {
+        submittedValues: {
+          csat_survey_response: {
+            rating: this.selectedRating,
+            feedback_message: this.feedback,
+          },
+        },
+        messageId: this.messageId,
+      });
+    } catch (error) {
+      // Ignore error
+    } finally {
+      this.isUpdating = false;
+    }
+  },
+}
+```
+
+---
+
+## 三、跨域回调与数据提交
+
+### 3.1 CORS 配置
+
+**配置文件**：`config/initializers/cors.rb:1-35`
+
+```ruby
+Rails.application.config.middleware.insert_before 0, Rack::Cors do
+  allow do
+    origins '*'
+    # 允许所有公共 API 端点的跨域访问
+    resource '/public/api/*', headers: :any, methods: :any
+  end
+end
+```
+
+**关键配置说明**：
+- `origins '*'`：允许来自任何域名的请求
+- `resource '/public/api/*'`：所有 `/public/api/` 下的接口都支持跨域
+- `methods: :any`：允许所有 HTTP 方法（GET, POST, PATCH, PUT, DELETE 等）
+- `headers: :any`：允许任何请求头
+
+### 3.2 CSRF 处理
+
+**公共控制器基类**：`app/controllers/public_controller.rb:1-28`
+
+```ruby
+class PublicController < ActionController::Base
+  include RequestExceptionHandler
+  skip_before_action :verify_authenticity_token  # 跳过 CSRF 验证
+end
+```
+
+---
+
+## 四、评价数据写回系统
+
+### 4.1 前端 API 调用
+
+**Store Action**：`app/javascript/widget/store/modules/message.js:13-44`
+
+```javascript
+export const actions = {
+  update: async (
+    { commit, dispatch, getters: { getUIFlags: uiFlags } },
+    { email, messageId, submittedValues }
+  ) => {
+    if (uiFlags.isUpdating) {
+      return;
+    }
+    commit('toggleUpdateStatus', true);
+    try {
+      await MessageAPI.update({
+        email,
+        messageId,
+        values: submittedValues,
+      });
+      commit(
+        'conversation/updateMessage',
+        {
+          id: messageId,
+          content_attributes: {
+            submitted_email: email,
+            submitted_values: email ? null : submittedValues,
+          },
+        },
+        { root: true }
+      );
+      dispatch('contacts/get', {}, { root: true });
+    } catch (error) {
+      // Ignore error
+    }
+    commit('toggleUpdateStatus', false);
+  },
+};
+```
+
+**API 客户端**：`app/javascript/widget/api/message.js:1-12`
+
+```javascript
+import authEndPoint from 'widget/api/endPoints';
+import { API } from 'widget/helpers/axios';
+
+export default {
+  update: ({ messageId, email, values }) => {
+    const urlData = authEndPoint.updateMessage(messageId);
+    return API.patch(urlData.url, {
+      contact: { email },
+      message: { submitted_values: values },
+    });
+  },
+};
+```
+
+---
+
+### 4.2 后端控制器处理
+
+**CSAT 控制器**：`app/controllers/public/api/v1/csat_survey_controller.rb:1-32`
+
+```ruby
+class Public::Api::V1::CsatSurveyController < PublicController
+  before_action :set_conversation
+  before_action :set_message
+
+  def show; end
+
+  def update
+    # 14 天后锁定，无法修改
+    render json: { error: 'You cannot update the CSAT survey after 14 days' }, status: :unprocessable_entity and return if check_csat_locked
+
+    @message.update!(message_update_params[:message])
+  end
+
+  private
+
+  def set_conversation
+    return if params[:id].blank?
+    @conversation = Conversation.find_by!(uuid: params[:id])  # 通过 UUID 查找
+  end
+
+  def set_message
+    @message = @conversation.messages.find_by!(content_type: 'input_csat')
+  end
+
+  def message_update_params
+    params.permit(message: [{ submitted_values: [:name, :title, :value, { csat_survey_response: [:feedback_message, :rating] }] }])
+  end
+
+  def check_csat_locked
+    (Time.zone.now.to_date - @message.created_at.to_date).to_i > 14
+  end
+end
+```
+
+**路由配置**：`config/routes.rb:563`
+
+```ruby
+resources :csat_survey, only: [:show, :update]
+```
+
+**路由生成**：
+- `GET /public/api/v1/csat_survey/:id` → 获取 CSAT 调查信息
+- `PATCH /public/api/v1/csat_survey/:id` → 提交 CSAT 评价
+
+**参数说明**：
+- `:id`：对话的 UUID（不是数据库 ID）
+- 提交数据格式：
+  ```json
+  {
+    "message": {
+      "submitted_values": {
+        "csat_survey_response": {
+          "rating": 5,
+          "feedback_message": "服务非常好！"
+        }
+      }
+    }
+  }
+  ```
+
+---
+
+### 4.3 CSAT 响应记录创建
+
+**消息更新事件监听**：`app/listeners/csat_survey_listener.rb:10-15`
+
+```ruby
+def message_updated(event)
+  message = extract_message_and_account(event)[0]
+  return unless message.input_csat?
+  CsatSurveys::ResponseBuilder.new(message: message).perform
+end
+```
+
+**响应构建器**：`app/builders/csat_surveys/response_builder.rb:1-28`
+
+```ruby
+class CsatSurveys::ResponseBuilder
+  pattr_initialize [:message]
+
+  def perform
+    raise 'Invalid Message' unless message.input_csat?
+
+    conversation = message.conversation
+    rating = message.content_attributes.dig('submitted_values', 'csat_survey_response', 'rating')
+    feedback_message = message.content_attributes.dig('submitted_values', 'csat_survey_response', 'feedback_message')
+
+    return if rating.blank?
+
+    process_csat_response(conversation, rating, feedback_message)
+  end
+
+  private
+
+  def process_csat_response(conversation, rating, feedback_message)
+    csat_survey_response = message.csat_survey_response || CsatSurveyResponse.new(
+      message_id: message.id,
+      account_id: message.account_id,
+      conversation_id: message.conversation_id,
+      contact_id: conversation.contact_id,
+      assigned_agent: conversation.assignee
+    )
+    csat_survey_response.rating = rating
+    csat_survey_response.feedback_message = feedback_message
+    csat_survey_response.save!
+    csat_survey_response
+  end
+end
+```
+
+---
+
+### 4.4 CSAT 响应数据模型
+
+**数据模型**：`app/models/csat_survey_response.rb:1-47`
+
+```ruby
+class CsatSurveyResponse < ApplicationRecord
+  belongs_to :account
+  belongs_to :conversation
+  belongs_to :contact
+  belongs_to :message
+  belongs_to :assigned_agent, class_name: 'User', optional: true, inverse_of: :csat_survey_responses
+  belongs_to :review_notes_updated_by, class_name: 'User', optional: true
+
+  validates :rating, presence: true, inclusion: { in: [1, 2, 3, 4, 5] }
+  validates :account_id, presence: true
+  validates :contact_id, presence: true
+  validates :conversation_id, presence: true
+
+  scope :filter_by_created_at, ->(range) { where(created_at: range) if range.present? }
+  scope :filter_by_assigned_agent_id, ->(user_ids) { where(assigned_agent_id: user_ids) if user_ids.present? }
+  scope :filter_by_inbox_id, ->(inbox_id) { joins(:conversation).where(conversations: { inbox_id: inbox_id }) if inbox_id.present? }
+  scope :filter_by_team_id, ->(team_id) { joins(:conversation).where(conversations: { team_id: team_id }) if team_id.present? }
+  scope :filter_by_rating, ->(rating) { where(rating: rating) if rating.present? }
+end
+```
+
+**数据库字段**：
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| `id` | bigint | 主键 |
+| `rating` | integer | 评分（1-5）必填 |
+| `feedback_message` | text | 反馈消息 |
+| `csat_review_notes` | text | 内部评审备注 |
+| `account_id` | bigint | 账户 ID |
+| `conversation_id` | bigint | 对话 ID |
+| `contact_id` | bigint | 联系人 ID |
+| `message_id` | bigint | 消息 ID（唯一） |
+| `assigned_agent_id` | bigint | 分配的客服 ID |
+| `review_notes_updated_at` | datetime | 评审备注更新时间 |
+| `review_notes_updated_by_id` | bigint | 评审备注更新人 ID |
+
+---
+
+## 五、完整流程时序图
+
+```
+┌─────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────────┐
+│ 对话状态变更 │────▶│CsatSurvey    │────▶│CsatSurvey    │────▶│ 创建 CSAT    │────▶│ 消息存储        │
+│ (resolved)  │     │Listener      │     │Service       │     │ 消息 (input_csat) ││ (messages表)    │
+└─────────────┘     └──────────────┘     └──────────────┘     └──────────────┘     └──────────────────┘
+                                                                      │
+                                                                      ▼
+                                                           ┌──────────────────┐
+                                                           │ 推送至前端组件   │
+                                                           │ (CustomerSatis- │
+                                                           │ faction.vue)    │
+                                                           └────────┬─────────┘
+                                                                    │
+                                                                    ▼
+┌──────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ 前端更新 Store   │◀────│ 用户提交评价  │◀────│ 用户选择评分  │◀────│ 用户选择评分  │
+│ (message/update) │     │ (点击提交)   │     │ (emoji/star) │     │ (emoji/star) │
+└────────┬─────────┘     └──────────────┘     └──────────────┘     └──────────────┘
+         │
+         ▼
+┌──────────────────┐     ┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│ Axios PATCH      │────▶│ /public/api/ │────▶│CsatSurvey    │────▶│ 更新 Message │
+│ 请求 (CORS)      │     │ v1/csat_     │     │Controller    │     │ content_     │
+│                  │     │ survey/:id   │     │#update       │     │ attributes   │
+└──────────────────┘     └──────────────┘     └──────────────┘     └──────┬───────┘
+                                                                           │
+                                                                           ▼
+┌──────────────────┐     ┌──────────────┐     ┌──────────────┐
+│ CsatSurveyResp-  │◀────│CsatSurveys:: │◀────│ 触发消息更新  │
+│ onse 数据持久化   │     │Response      │     │ 事件        │
+│ (csat_survey_    │     │Builder       │     │ (message_    │
+│ responses表)     │     │              │     │ updated)     │
+└──────────────────┘     └──────────────┘     └──────────────┘
+```
+
+---
+
+## 六、关键技术点总结
+
+### 6.1 安全性设计
+
+| 机制 | 实现位置 | 说明 |
+|------|---------|------|
+| 跨域支持 | `config/initializers/cors.rb` | `/public/api/*` 允许所有源 |
+| CSRF 跳过 | `app/controllers/public_controller.rb` | 公共接口不验证 CSRF Token |
+| 身份识别 | `Conversation.find_by!(uuid: params[:id])` | 使用 UUID 而非自增 ID |
+| 时间锁 | `check_csat_locked` | 14 天后无法修改评价 |
+
+### 6.2 数据流转
+
+```
+用户选择评分
+    ↓
+CustomerSatisfaction.vue (onSubmit)
+    ↓
+Vuex Store: message/update
+    ↓
+Axios: PATCH /public/api/v1/csat_survey/:id
+    ↓
+CsatSurveyController#update
+    ↓
+Message.update!(content_attributes)
+    ↓
+消息更新事件触发
+    ↓
+CsatSurveyListener#message_updated
+    ↓
+CsatSurveys::ResponseBuilder#perform
+    ↓
+CsatSurveyResponse.create / update
+    ↓
+数据持久化到 csat_survey_responses 表
+```
+
+### 6.3 核心文件索引
+
+| 功能 | 文件路径 |
+|------|---------|
+| CSAT 发送服务 | `app/services/csat_survey_service.rb` |
+| CSAT 消息模板 | `app/services/message_templates/template/csat_survey.rb` |
+| CSAT 事件监听 | `app/listeners/csat_survey_listener.rb` |
+| CSAT 响应构建 | `app/builders/csat_surveys/response_builder.rb` |
+| CSAT 控制器 | `app/controllers/public/api/v1/csat_survey_controller.rb` |
+| CSAT 数据模型 | `app/models/csat_survey_response.rb` |
+| CSAT 前端组件 | `app/javascript/shared/components/CustomerSatisfaction.vue` |
+| CORS 配置 | `config/initializers/cors.rb` |
+| 公共控制器基类 | `app/controllers/public_controller.rb` |
+
+---
+
+## 七、API 示例
+
+### 7.1 提交 CSAT 评价
+
+**请求**：
+```bash
+PATCH /public/api/v1/csat_survey/{conversation_uuid}
+Content-Type: application/json
+
+{
+  "message": {
+    "submitted_values": {
+      "csat_survey_response": {
+        "rating": 5,
+        "feedback_message": "客服服务非常专业，问题解决得很快！"
+      }
+    }
+  }
+}
+```
+
+**成功响应**（200 OK）：
+```json
+{}
+```
+
+**失败响应**（422 Unprocessable Entity）：
+```json
+{
+  "error": "You cannot update the CSAT survey after 14 days"
+}
+```
+
+### 7.2 获取 CSAT 调查信息
+
+**请求**：
+```bash
+GET /public/api/v1/csat_survey/{conversation_uuid}
+```
+
+**响应**（通过 JBuilder 序列化）：
+- 参考 `app/views/public/api/v1/models/_csat_survey.json.jbuilder`
