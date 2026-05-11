@@ -634,7 +634,11 @@ end
 
 ### 9.1 通知设置缺失时的空对象异常
 
-#### 9.1.1 问题源码证据
+#### 9.1.1 结论
+
+**结论**：`PushNotificationService` 和 `EmailNotificationService` 的 `user_subscribed_to_notification?` 方法在通知设置记录不存在时，会对 `nil` 调用 `public_send`，抛出 `NoMethodError`。
+
+#### 9.1.2 源码位置
 
 **PushNotificationService** (`app/services/notification/push_notification_service.rb:22-27`):
 
@@ -656,43 +660,7 @@ def user_subscribed_to_notification?
 end
 ```
 
-#### 9.1.2 异常触发条件
-
-当 `find_by` 返回 `nil`（通知设置记录不存在）时，第 24 行（推送服务）或第 28 行（邮件服务）会在 `nil` 上调用 `public_send`，抛出：
-
-```
-NoMethodError: undefined method `public_send' for nil:NilClass
-```
-
-#### 9.1.3 影响路径
-
-```
-通知创建
-    ↓
-after_create_commit 回调触发 process_notification_delivery
-    ↓
-PushNotificationJob / EmailNotificationJob 入队
-    ↓
-Job 执行
-    ↓
-调用 user_subscribed_to_notification?
-    ↓
-find_by 返回 nil
-    ↓
-nil.public_send(...)
-    ↓
-NoMethodError 抛出
-    ↓
-Sidekiq 捕获异常，标记 Job 失败
-    ↓
-Sidekiq 重试（最多 3 次）
-    ↓
-重试耗尽后进入 Dead Job 队列
-```
-
-#### 9.1.4 通知设置的创建机制
-
-**源码位置**：`app/models/account_user.rb:39, 45-50`
+**通知设置创建机制** (`app/models/account_user.rb:39, 45-50`):
 
 ```ruby
 after_create_commit :notify_creation, :create_notification_setting
@@ -705,35 +673,38 @@ def create_notification_setting
 end
 ```
 
+**Sidekiq 重试配置** (`config/sidekiq.yml:7`):
+
+```yaml
+:max_retries: 3
+```
+
 **证据**：
-- `AccountUser` 创建后通过 `after_create_commit` 回调自动创建 `NotificationSetting`
-- 默认启用 `email_conversation_assignment` 和 `push_conversation_assignment`
-- 其他通知类型默认禁用
+- 两个服务的 `user_subscribed_to_notification?` 方法都使用 `find_by` 查询通知设置
+- `find_by` 找不到记录时返回 `nil`
+- 返回值 `nil` 直接用于调用 `public_send`
+- `AccountUser` 创建后通过 `after_create_commit` 回调创建通知设置
+- Sidekiq 全局配置 `max_retries: 3`
 
-#### 9.1.5 可能导致通知设置缺失的场景
-
-| 场景 | 说明 | 证据 |
-|------|------|------|
-| 数据竞态 | `after_create_commit` 是异步的，可能在通知创建后、设置创建前触发推送 | `account_user.rb:39` 使用 `after_create_commit` 而非 `before_create` |
-| 直接创建通知 | 绕过 `AccountUser` 直接创建通知（如测试代码） | `notification_builder_spec.rb` 中可能存在此类场景 |
-| 手动操作 | 管理员从数据库直接删除通知设置 | 无代码层面保护 |
-| 数据迁移问题 | 历史数据迁移未正确创建设置 | 需检查迁移脚本 |
-
-#### 9.1.6 影响范围
+#### 9.1.3 影响范围
 
 | 影响对象 | 说明 |
 |---------|------|
-| 推送通知 | 整个 PushNotificationJob 失败，所有订阅用户都无法收到推送 |
-| 邮件通知 | 整个 EmailNotificationJob 失败，所有订阅用户都无法收到邮件 |
-| 单个用户 | 只要目标用户缺少通知设置，整个 Job 失败 |
+| PushNotificationJob | 异常抛出后 Job 失败，Sidekiq 重试最多 3 次，重试耗尽后进入 Dead Job 队列 |
+| EmailNotificationJob | 同上，邮件通知 Job 失败 |
+| 用户体验 | 目标用户缺少通知设置时，整个通知任务失败 |
 
 ---
 
 ### 9.2 订阅删除接口的越权风险
 
-#### 9.2.1 问题源码证据
+#### 9.2.1 结论
 
-**源码位置**：`app/controllers/api/v1/notification_subscriptions_controller.rb:10-14`
+**结论**：`DELETE /api/v1/notification_subscriptions` 接口在查询订阅时只过滤 `push_token`，未限制 `user_id = current_user.id`，导致任意已认证用户可删除他人的 FCM 订阅。
+
+#### 9.2.2 源码位置
+
+**删除接口** (`app/controllers/api/v1/notification_subscriptions_controller.rb:10-14`):
 
 ```ruby
 def destroy
@@ -745,73 +716,7 @@ def destroy
 end
 ```
 
-#### 9.2.2 问题分析
-
-| 问题 | 说明 |
-|------|------|
-| 缺少用户限制 | SQL 查询只过滤 `push_token`，未添加 `user_id = current_user.id` 条件 |
-| 可删除任意订阅 | 只要知道任何用户的 `push_token`，就可以删除其订阅 |
-| 静默成功 | 即使订阅不属于当前用户，删除也返回 `200 OK`，无任何提示 |
-
-#### 9.2.3 攻击路径
-
-```
-攻击者获取目标用户的 push_token
-    ↓
-攻击者登录自己的账号（获取有效 auth token）
-    ↓
-调用 DELETE /api/v1/notification_subscriptions
-    参数: push_token = 目标用户的 token
-    ↓
-查询: SELECT * FROM notification_subscriptions
-      WHERE subscription_attributes->>'push_token' = '目标token'
-    ↓
-找到目标用户的订阅记录（不属于攻击者）
-    ↓
-调用 destroy! 删除该订阅
-    ↓
-返回 200 OK
-    ↓
-目标用户无法再收到推送通知
-```
-
-#### 9.2.4 测试用例分析
-
-**测试文件**：`spec/controllers/api/v1/notification_subscriptions_controller_spec.rb:96-108`
-
-```ruby
-it 'delete existing notification subscription if subscription exists' do
-  subscription = create(:notification_subscription, 
-                        subscription_type: 'fcm', 
-                        subscription_attributes: { push_token: 'bUvZo8AYGGmCMr' },
-                        user: agent)  # 订阅属于 agent
-  delete '/api/v1/notification_subscriptions',
-         params: { push_token: subscription.subscription_attributes['push_token'] },
-         headers: agent.create_new_auth_token,  # 使用 agent 自己的 token
-         as: :json
-
-  expect(response).to have_http_status(:success)
-  expect { subscription.reload }.to raise_exception(ActiveRecord::RecordNotFound)
-end
-```
-
-**测试缺失**：
-- 测试只验证了"用户可以删除自己的订阅"
-- **缺少测试用例验证"用户不能删除他人的订阅"**
-- 这意味着越权问题没有被测试覆盖
-
-#### 9.2.5 影响范围
-
-| 影响对象 | 说明 |
-|---------|------|
-| 所有 FCM 订阅 | 攻击者可删除任何用户的移动端推送订阅 |
-| 用户体验 | 用户无法收到推送通知，可能错过重要消息 |
-| 攻击成本 | 只要能获取他人 push_token（如日志泄露、中间人攻击）即可实施 |
-| 隐蔽性 | 被攻击者可能长时间不知道订阅被删除 |
-
-#### 9.2.6 与创建接口的对比
-
-**创建接口** (`notification_subscriptions_controller.rb:4-8`):
+**创建接口** (`app/controllers/api/v1/notification_subscriptions_controller.rb:4-8`):
 
 ```ruby
 def create
@@ -823,10 +728,38 @@ def create
 end
 ```
 
-**对比**：
-- 创建接口明确使用 `@user`（即 `current_user`）
-- 删除接口完全不检查 `user_id`
-- 两个接口的权限模型不一致
+**删除接口测试** (`spec/controllers/api/v1/notification_subscriptions_controller_spec.rb:96-108`):
+
+```ruby
+it 'delete existing notification subscription if subscription exists' do
+  subscription = create(:notification_subscription, 
+                        subscription_type: 'fcm', 
+                        subscription_attributes: { push_token: 'bUvZo8AYGGmCMr' },
+                        user: agent)
+  delete '/api/v1/notification_subscriptions',
+         params: { push_token: subscription.subscription_attributes['push_token'] },
+         headers: agent.create_new_auth_token,
+         as: :json
+
+  expect(response).to have_http_status(:success)
+  expect { subscription.reload }.to raise_exception(ActiveRecord::RecordNotFound)
+end
+```
+
+**证据**：
+- 删除接口的 SQL 查询条件：`subscription_attributes->>'push_token' = ?`
+- 查询未包含 `user_id = current_user.id` 条件
+- 创建接口使用 `@user`（即 `current_user`）作为创建者
+- 删除接口与创建接口的权限模型不一致
+- 现有测试仅验证"用户可以删除自己的订阅"，未验证"用户不能删除他人的订阅"
+
+#### 9.2.3 影响范围
+
+| 影响对象 | 说明 |
+|---------|------|
+| 所有 FCM 类型订阅 | 任意已认证用户只要知道目标用户的 `push_token`，即可删除其订阅 |
+| 接口响应 | 无论订阅是否属于当前用户，删除成功均返回 `200 OK` |
+| 测试覆盖 | 现有测试用例未覆盖越权场景 |
 
 ---
 
@@ -850,6 +783,7 @@ end
 | 订阅模型 | `app/models/notification_subscription.rb` | 1-29 |
 | 通知触发入口 | `app/models/notification.rb` | 155-164 |
 | 推送服务主逻辑 | `app/services/notification/push_notification_service.rb` | 1-172 |
+| 推送用户设置检查 | `app/services/notification/push_notification_service.rb` | 22-27 |
 | 推送路由决策 | `app/services/notification/push_notification_service.rb` | 6-14 |
 | 浏览器推送 | `app/services/notification/push_notification_service.rb` | 66-88 |
 | FCM 直接发送 | `app/services/notification/push_notification_service.rb` | 90-100 |
@@ -857,9 +791,15 @@ end
 | FCM 错误处理 | `app/services/notification/push_notification_service.rb` | 118-124 |
 | FCM 消息体 | `app/services/notification/push_notification_service.rb` | 126-171 |
 | FCM 认证服务 | `app/services/notification/fcm_service.rb` | 1-40 |
+| 邮件通知服务 | `app/services/notification/email_notification_service.rb` | 1-32 |
+| 邮件用户设置检查 | `app/services/notification/email_notification_service.rb` | 26-31 |
 | ChatwootHub 客户端 | `lib/chatwoot_hub.rb` | 1-133 |
 | Hub 推送发送 | `lib/chatwoot_hub.rb` | 108-119 |
 | 异常分类列表 | `lib/exception_list.rb` | 1-19 |
+| 通知设置模型 | `app/models/notification_setting.rb` | 1-35 |
+| AccountUser 关联 | `app/models/account_user.rb` | 27-86 |
+| 通知设置创建回调 | `app/models/account_user.rb` | 39, 45-50 |
 | 推送 Job | `app/jobs/notification/push_notification_job.rb` | 1-7 |
 | 基础 Job | `app/jobs/application_job.rb` | 1-8 |
 | Sidekiq 配置 | `config/sidekiq.yml` | 1-39 |
+| 订阅 API 测试 | `spec/controllers/api/v1/notification_subscriptions_controller_spec.rb` | 84-110 |
